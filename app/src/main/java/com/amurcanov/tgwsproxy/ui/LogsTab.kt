@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -41,23 +42,15 @@ fun LogsTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val currentLogs by LogManager.logs.collectAsStateWithLifecycle()
+    var showSupportReport by remember { mutableStateOf(false) }
+    if (showSupportReport) SupportReportDialog(settingsStore) { showSupportReport = false }
 
     val savedInfo by settingsStore.logShowInfo.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_LOG_SHOW_INFO)
     val savedError by settingsStore.logShowError.collectAsStateWithLifecycle(initialValue = SettingsStore.DEFAULT_LOG_SHOW_ERROR)
     val savedNull by settingsStore.logShowNull.collectAsStateWithLifecycle(initialValue = false)
 
-    val nullLogsDisabled = stringResource(com.amurcanov.tgwsproxy.R.string.null_logs_disabled)
-    val filteredLogs = remember(currentLogs, savedInfo, savedError, savedNull, nullLogsDisabled) {
-        if (savedNull) {
-            listOf(LogEntry(
-                key = "null_msg",
-                message = nullLogsDisabled,
-                count = 1,
-                isError = false,
-                priority = 4,
-                isEssential = true
-            ))
-        } else {
+    val filteredLogs = remember(currentLogs, savedInfo, savedError, savedNull) {
+        if (savedNull) currentLogs else {
             currentLogs.filter { entry ->
                 entry.isEssential ||
                 (savedInfo && entry.priority == 4) ||
@@ -95,11 +88,14 @@ fun LogsTab(settingsStore: SettingsStore) {
                 color = MaterialTheme.colorScheme.onSurface
             )
             Row {
+                IconButton(onClick = { showSupportReport = true }) {
+                    Icon(Icons.Default.Share, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.support_share), tint = MaterialTheme.colorScheme.primary)
+                }
                 IconButton(onClick = { LogManager.clearLogs() }) {
                     Icon(Icons.Default.Delete, contentDescription = stringResource(com.amurcanov.tgwsproxy.R.string.clear), tint = MaterialTheme.colorScheme.primary)
                 }
                 IconButton(onClick = {
-                    val text = filteredLogs.joinToString("\n") { "${it.message} (x${it.count})" }
+                    val text = filteredLogs.joinToString("\n") { "${com.amurcanov.tgwsproxy.SupportReport.utc(it.timestamp)} ${it.message} (x${it.count})" }
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val clip = ClipData.newPlainText("TgWsProxy Logs", text)
                     clipboard.setPrimaryClip(clip)
@@ -120,8 +116,8 @@ fun LogsTab(settingsStore: SettingsStore) {
             LogFilterChip("ERROR", savedError && !savedNull, true, modifier = Modifier.weight(1f)) {
                 scope.launch { settingsStore.saveLogFilters(false, savedInfo, !savedError, false) }
             }
-            LogFilterChip("NULL", savedNull, true, modifier = Modifier.weight(1f)) {
-                scope.launch { settingsStore.saveLogFilters(false, false, false, !savedNull) }
+            LogFilterChip(stringResource(com.amurcanov.tgwsproxy.R.string.logs_all), savedNull, true, modifier = Modifier.weight(1f)) {
+                scope.launch { settingsStore.saveLogFilters(false, true, true, !savedNull) }
             }
         }
         val isDark = isSystemInDarkTheme()
@@ -133,6 +129,9 @@ fun LogsTab(settingsStore: SettingsStore) {
                 .clip(RoundedCornerShape(24.dp))
                 .background(terminalBg)
         ) {
+            if (filteredLogs.isEmpty()) Text(
+                stringResource(if (currentLogs.isEmpty()) com.amurcanov.tgwsproxy.R.string.logs_empty else com.amurcanov.tgwsproxy.R.string.logs_filtered_empty),
+                modifier = Modifier.padding(20.dp), color = AppColors.terminalText)
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize().padding(16.dp),
@@ -232,7 +231,9 @@ private fun LogLine(entry: LogEntry) {
         Spacer(modifier = Modifier.width(6.dp))
 
         Text(
-            text = entry.message,
+            text = remember(entry.timestamp, entry.message) {
+                java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(entry.timestamp)) + " " + entry.message
+            },
             color = color,
             fontSize = 13.sp,
             fontFamily = FontFamily.Monospace,

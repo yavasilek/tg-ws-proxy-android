@@ -11,7 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
-import android.util.Log
+import com.amurcanov.tgwsproxy.AppLog as Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -101,7 +101,7 @@ class ProxyService : Service() {
         if (intent?.action == ACTION_START) promoteToForeground()
         when (intent?.action) {
             ACTION_START -> {
-                LogManager.clearLogs()
+                Log.i(TAG, "Start requested")
                 val bindIp = intent.getStringExtra(EXTRA_BIND_IP) ?: "127.0.0.1"
                 val port = intent.getIntExtra(EXTRA_PORT, 1443)
                 val ips = intent.getStringExtra(EXTRA_IPS) ?: ""
@@ -300,6 +300,7 @@ class ProxyService : Service() {
             !network.validated -> ConnectionState.UNVERIFIED
             else -> ConnectionState.READY
         }
+        if (state != _connectionState.value) Log.i(TAG, "Connection state: $state")
         _connectionState.value = state
         _isVerifiedRunning.value = engineReady && network.available && state != ConnectionState.RECONNECTING
         updateNotification(getString(connectionStatusResource(state)), force = true)

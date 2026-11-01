@@ -151,4 +151,14 @@
     <string name="status_network_unverified">Прокси работает - интернет не проверен</string>
     <string name="status_proxy_ready">Прокси работает</string>
     <string name="status_service_error">Не удалось запустить прокси</string>
+    <string name="support_report">Диагностический отчёт</string>
+    <string name="support_report_help">Воспроизведите проблему, опишите её и сформируйте отчёт. Проверьте предпросмотр перед отправкой TXT-файла. Типовые секреты, ссылки и адреса удаляются. Автоматической отправки нет.</string>
+    <string name="support_description">Что произошло и когда? (необязательно)</string>
+    <string name="support_preparing">Подготовка...</string>
+    <string name="support_failed">Не удалось подготовить или отправить отчёт. Попробуйте скопировать его.</string>
+    <string name="support_preview">Предпросмотр</string>
+    <string name="support_share">Поделиться отчётом</string>
+    <string name="logs_all">ВСЕ</string>
+    <string name="logs_empty">Событий пока нет. Запустите прокси или воспроизведите проблему.</string>
+    <string name="logs_filtered_empty">Записи скрыты текущими фильтрами. Нажмите «ВСЕ».</string>
 </resources>

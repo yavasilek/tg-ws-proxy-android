@@ -13,5 +13,6 @@ data class LogEntry(
     val count: Int,
     val isError: Boolean,
     val priority: Int, // 3=DEBUG, 4=INFO, 5=WARN, 6=ERROR
-    val isEssential: Boolean = false
+    val isEssential: Boolean = false,
+    val timestamp: Long = System.currentTimeMillis()
 )

@@ -151,4 +151,14 @@
     <string name="status_network_unverified">Proxy running - internet not verified</string>
     <string name="status_proxy_ready">Proxy running</string>
     <string name="status_service_error">Could not start proxy</string>
+    <string name="support_report">Diagnostic report</string>
+    <string name="support_report_help">Reproduce the issue, describe what happened, then build a report. Review the preview before sharing the TXT file. Common secrets, URLs and addresses are removed. Nothing is sent automatically.</string>
+    <string name="support_description">What happened and when? (optional)</string>
+    <string name="support_preparing">Preparing...</string>
+    <string name="support_failed">Could not prepare or share the report. Try copying it.</string>
+    <string name="support_preview">Preview</string>
+    <string name="support_share">Share report</string>
+    <string name="logs_all">ALL</string>
+    <string name="logs_empty">No events yet. Start the proxy or reproduce the issue.</string>
+    <string name="logs_filtered_empty">The current filters hide these events. Select ALL.</string>
 </resources>

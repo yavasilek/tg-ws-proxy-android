@@ -21,7 +21,7 @@ class SettingsStore(private val context: Context) {
         const val DEFAULT_DIRECT_DC4_IP = "149.154.167.220"
         private const val LEGACY_DIRECT_DC_IP = "149.154.167.220"
         const val DEFAULT_LOG_SHOW_INFO = true
-        const val DEFAULT_LOG_SHOW_ERROR = false
+        const val DEFAULT_LOG_SHOW_ERROR = true
     }
 
     private object Keys {

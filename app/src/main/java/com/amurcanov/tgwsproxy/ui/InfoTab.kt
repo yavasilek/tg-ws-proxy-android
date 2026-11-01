@@ -1,9 +1,6 @@
 package com.amurcanov.tgwsproxy.ui
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
-import android.os.Build
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
@@ -85,8 +82,6 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.BuildConfig
-import com.amurcanov.tgwsproxy.LogEntry
-import com.amurcanov.tgwsproxy.LogManager
 import com.amurcanov.tgwsproxy.R
 import com.amurcanov.tgwsproxy.SettingsStore
 import com.amurcanov.tgwsproxy.UPDATE_DIALOG_ACTION_POSTPONED
@@ -133,18 +128,14 @@ fun InfoTab(settingsStore: SettingsStore) {
     val scope = rememberCoroutineScope()
     var showHelpDialog by remember { mutableStateOf(false) }
     var showDonateDialog by remember { mutableStateOf(false) }
+    var showSupportReport by remember { mutableStateOf(false) }
+    if (showSupportReport) SupportReportDialog(settingsStore) { showSupportReport = false }
     var actionsExpanded by rememberSaveable { mutableStateOf(true) }
     var projectExpanded by rememberSaveable { mutableStateOf(true) }
     var isCheckingUpdates by remember { mutableStateOf(false) }
     var pendingManualRelease by remember { mutableStateOf<com.amurcanov.tgwsproxy.AppReleaseInfo?>(null) }
-    val savedPort by settingsStore.port.collectAsStateWithLifecycle(initialValue = "1443")
-    val savedPoolSize by settingsStore.poolSize.collectAsStateWithLifecycle(initialValue = 4)
-    val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
-    val savedCustomCfDomainEnabled by settingsStore.customCfDomainEnabled.collectAsStateWithLifecycle(initialValue = false)
-    val savedCustomCfDomain by settingsStore.customCfDomain.collectAsStateWithLifecycle(initialValue = "")
     val updateLatestVersion by settingsStore.updateLatestVersion.collectAsStateWithLifecycle(initialValue = "")
     val updateLastError by settingsStore.updateLastError.collectAsStateWithLifecycle(initialValue = "")
-    val currentLogs by LogManager.logs.collectAsStateWithLifecycle()
     val currentVersion = remember { "v${BuildConfig.VERSION_NAME.removePrefix("v")}" }
     val scrollState = rememberScrollState()
     val updateStatusSubtitle = when {
@@ -155,15 +146,6 @@ fun InfoTab(settingsStore: SettingsStore) {
         updateLastError.isNotBlank() -> stringResource(R.string.update_last_check_failed)
         else -> stringResource(R.string.update_check_manually)
     }
-    val reportText = buildSupportReport(
-        port = savedPort,
-        poolSize = savedPoolSize,
-        cfEnabled = savedCfEnabled,
-        customCfDomainEnabled = savedCustomCfDomainEnabled,
-        customCfDomain = savedCustomCfDomain,
-        logs = currentLogs,
-        context = context
-    )
 
     Box(modifier = Modifier.fillMaxSize()) {
         Column(
@@ -244,9 +226,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                     subtitle = stringResource(R.string.report_subtitle),
                     modifier = Modifier.weight(1f),
                     onClick = {
-                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        clipboard?.setPrimaryClip(ClipData.newPlainText("TgWsProxy Report", reportText))
-                        Toast.makeText(context, context.getString(R.string.report_copied), Toast.LENGTH_SHORT).show()
+                        showSupportReport = true
                     },
                     icon = {
                         Icon(
@@ -1045,97 +1025,6 @@ private fun SupportAccentCard(onClick: () -> Unit) {
             }
         }
     }
-}
-
-private fun buildSupportReport(
-    port: String,
-    poolSize: Int,
-    cfEnabled: Boolean,
-    customCfDomainEnabled: Boolean,
-    customCfDomain: String,
-    logs: List<LogEntry>,
-    context: Context
-): String {
-    val androidVersion = Build.VERSION.RELEASE ?: "?"
-    val sdkInt = Build.VERSION.SDK_INT
-    val primaryAbi = Build.SUPPORTED_ABIS.firstOrNull().orEmpty().ifBlank { "unknown" }
-    val supportedAbis = Build.SUPPORTED_ABIS.joinToString().ifBlank { "unknown" }
-    val supported32Abis = Build.SUPPORTED_32_BIT_ABIS.joinToString().ifBlank { "none" }
-    val supported64Abis = Build.SUPPORTED_64_BIT_ABIS.joinToString().ifBlank { "none" }
-    val manufacturer = Build.MANUFACTURER.orEmpty().ifBlank { "unknown" }
-    val brand = Build.BRAND.orEmpty().ifBlank { "unknown" }
-    val model = Build.MODEL.orEmpty().ifBlank { "unknown" }
-    val device = Build.DEVICE.orEmpty().ifBlank { "unknown" }
-    val product = Build.PRODUCT.orEmpty().ifBlank { "unknown" }
-    val hardware = Build.HARDWARE.orEmpty().ifBlank { "unknown" }
-    val board = Build.BOARD.orEmpty().ifBlank { "unknown" }
-    val romDisplay = Build.DISPLAY.orEmpty().ifBlank { "unknown" }
-    val buildId = Build.ID.orEmpty().ifBlank { "unknown" }
-    val buildFingerprint = Build.FINGERPRINT.orEmpty().ifBlank { "unknown" }
-    val buildType = Build.TYPE.orEmpty().ifBlank { "unknown" }
-    val socManufacturer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        Build.SOC_MANUFACTURER.orEmpty().ifBlank { "unknown" }
-    } else {
-        "n/a"
-    }
-    val socModel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        Build.SOC_MODEL.orEmpty().ifBlank { "unknown" }
-    } else {
-        "n/a"
-    }
-    val mode = if (cfEnabled) "Cloudflare" else context.getString(R.string.report_mode_direct)
-    val cfDomainLine = if (cfEnabled && customCfDomainEnabled && customCfDomain.isNotBlank()) {
-        "\n${context.getString(R.string.report_cf_domain, customCfDomain.trim())}"
-    } else {
-        ""
-    }
-
-    val recentErrors = logs
-        .asReversed()
-        .filter { it.priority >= 5 }
-        .take(10)
-
-    val errorsBlock = if (recentErrors.isEmpty()) {
-        context.getString(R.string.none_lower)
-    } else {
-        recentErrors.joinToString("\n") { entry ->
-            val level = when (entry.priority) {
-                6 -> "ERROR"
-                5 -> "WARN"
-                else -> "INFO"
-            }
-            "- [$level] ${entry.message}${if (entry.count > 1) " (x${entry.count})" else ""}"
-        }
-    }
-
-    return buildString {
-        appendLine(context.getString(R.string.report_app_version, BuildConfig.VERSION_NAME))
-        appendLine("Engine: Rust, Flowseal ${BuildConfig.UPSTREAM_VERSION}")
-        appendLine(context.getString(R.string.report_android, androidVersion, sdkInt))
-        appendLine(context.getString(R.string.report_device, manufacturer, brand, model))
-        appendLine(context.getString(R.string.report_device_code, device))
-        appendLine(context.getString(R.string.report_product, product))
-        appendLine("ABI: $primaryAbi")
-        appendLine(context.getString(R.string.report_all_abi, supportedAbis))
-        appendLine("32-bit ABI: $supported32Abis")
-        appendLine("64-bit ABI: $supported64Abis")
-        appendLine("SoC: $socManufacturer / $socModel")
-        appendLine("Hardware: $hardware")
-        appendLine("Board: $board")
-        appendLine("ROM: $romDisplay")
-        appendLine("Build ID: $buildId")
-        appendLine("Build type: $buildType")
-        appendLine("Fingerprint: $buildFingerprint")
-        appendLine(context.getString(R.string.report_settings))
-        appendLine(context.getString(R.string.report_mode, mode))
-        appendLine(context.getString(R.string.report_ws_pool, poolSize))
-        append(context.getString(R.string.report_port, port.trim().ifBlank { "1443" }))
-        append(cfDomainLine)
-        appendLine()
-        appendLine()
-        appendLine(context.getString(R.string.report_recent_errors))
-        append(errorsBlock)
-    }.trim()
 }
 
 @Composable

@@ -23,16 +23,26 @@ interface ProxyLibrary : Library {
     fun SetProxyProtocol(v: Int)
     fun GetSecretWithPrefix(): Pointer?
     fun GetStats(): Pointer?
+    fun DrainLogs(): Pointer?
     fun FreeString(p: Pointer)
 }
 
 object NativeProxy {
+    fun drainLogs(): String {
+        val ptr = ProxyLibrary.INSTANCE.DrainLogs() ?: return ""
+        return try { ptr.getString(0, "UTF-8") } finally { ProxyLibrary.INSTANCE.FreeString(ptr) }
+    }
+
     fun startProxy(host: String, port: Int, dcIps: String, secret: String, verbose: Int): Int {
-        return ProxyLibrary.INSTANCE.StartProxy(host, port, dcIps, secret, verbose)
+        val result = ProxyLibrary.INSTANCE.StartProxy(host, port, dcIps, secret, verbose)
+        LogManager.captureNative()
+        return result
     }
 
     fun stopProxy(): Int {
-        return ProxyLibrary.INSTANCE.StopProxy()
+        val result = ProxyLibrary.INSTANCE.StopProxy()
+        LogManager.captureNative()
+        return result
     }
 
     fun setPoolSize(size: Int) {

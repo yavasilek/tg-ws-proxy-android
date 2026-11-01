@@ -562,12 +562,65 @@ fn mask_domain(domain: &str) -> String {
 
 fn emit(prefix: &str, msg: &str) {
     let line = format!("{}{}", prefix, censor_domains(msg));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis() as u64;
+    NATIVE_LOGS.lock().push(timestamp, &line);
     eprintln!("{}", line);
     android_log_line(&line);
 }
 
 pub fn log_info(msg: &str) {
     emit("", msg);
+}
+
+// Bounded in-process transport, independent of logcat permissions and Activity lifetime.
+#[derive(Default)]
+struct NativeLogBuffer {
+    entries: std::collections::VecDeque<(u64, String)>,
+    dropped: u64,
+}
+
+impl NativeLogBuffer {
+    fn push(&mut self, timestamp: u64, line: &str) {
+        if self.entries.len() == 512 {
+            self.entries.pop_front();
+            self.dropped += 1;
+        }
+        self.entries.push_back((timestamp, line.chars().take(2048).collect()));
+    }
+    fn drain(&mut self) -> String {
+        let mut entries: Vec<_> = self.entries.drain(..).collect();
+        if self.dropped > 0 {
+            entries.push((0, format!("[WARN] Native log buffer overflow: {} older entries dropped", self.dropped)));
+            self.dropped = 0;
+        }
+        if entries.is_empty() { String::new() }
+        else { serde_json::to_string(&entries).unwrap_or_default() }
+    }
+}
+
+static NATIVE_LOGS: Lazy<parking_lot::Mutex<NativeLogBuffer>> =
+    Lazy::new(|| parking_lot::Mutex::new(NativeLogBuffer::default()));
+
+pub fn drain_logs() -> String { NATIVE_LOGS.lock().drain() }
+
+#[cfg(test)]
+mod log_buffer_tests {
+    use super::NativeLogBuffer;
+    #[test]
+    fn bounded_log_transport_preserves_order_reports_loss_and_drains_once() {
+        let mut buffer = NativeLogBuffer::default();
+        for i in 0..600 { buffer.push(i, &format!("line-{i}")); }
+        let entries: Vec<(u64, String)> = serde_json::from_str(&buffer.drain()).unwrap();
+        assert_eq!(entries.len(), 513);
+        assert_eq!(entries[0], (88, "line-88".into()));
+        assert!(entries.last().unwrap().1.contains("88 older entries dropped"));
+        assert!(buffer.drain().is_empty());
+        buffer.push(1, &"я".repeat(5000));
+        let entries: Vec<(u64, String)> = serde_json::from_str(&buffer.drain()).unwrap();
+        assert_eq!(entries[0].1.chars().count(), 2048);
+    }
 }
 pub fn log_warn(msg: &str) {
     emit("[WARN] ", msg);

@@ -317,6 +317,11 @@ pub extern "C" fn GetStats() -> *mut c_char {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn DrainLogs() -> *mut c_char {
+    CString::new(config::drain_logs()).unwrap_or_default().into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn GetSecretWithPrefix() -> *mut c_char {
     // ee-secret при включённом FakeTLS: ee{secret}{domain_hex} — как в оригинале.
     let sec = PROXY_SECRET.read().clone();
