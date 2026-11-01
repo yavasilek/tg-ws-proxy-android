@@ -1,10 +1,11 @@
+pub mod balancer;
 pub mod cfproxy;
 pub mod config;
 pub mod crypto;
 pub mod faketls;
+pub mod h2media;
 pub mod proxy;
 pub mod ws;
-pub mod balancer;
 
 use config::*;
 use once_cell::sync::OnceCell;
@@ -37,7 +38,7 @@ fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         // Многопоточный рантайм, кол-во воркеров адекватно мобиле
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(2)
             .thread_name("tgwsproxy-rt")
             .enable_all()
             .build()
@@ -74,6 +75,9 @@ pub unsafe extern "C" fn StartProxy(
     }
 
     let host = cstr_to_string(c_host);
+    if !(1..=65535).contains(&port) {
+        return -2;
+    }
     let go_port = port as u16;
     let dc_ips_str = cstr_to_string(c_dc_ips);
     let secret_str = cstr_to_string(c_secret);
@@ -82,12 +86,12 @@ pub unsafe extern "C" fn StartProxy(
     init_logging(is_verbose);
     cfproxy::clear_cfproxy_429_cooldowns();
 
-    if secret_str.len() == 32 {
-        if hex::decode(&secret_str).is_ok() {
-            *PROXY_SECRET.write() = secret_str.clone();
-        }
+    if secret_str.len() != 32 || hex::decode(&secret_str).is_err() {
+        return -2;
     }
+    *PROXY_SECRET.write() = secret_str.clone();
 
+    STATS.reset();
     cfproxy::init_cfproxy_domains();
 
     let dc_opt_map: HashMap<i32, String> = parse_cidr_pool(&dc_ips_str);
@@ -110,8 +114,15 @@ pub unsafe extern "C" fn StartProxy(
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
                 let _ = tx.send(Ok(()));
-                if let Err(e) =
-                    run_proxy(pools_task, host_task, go_port, map_task, cancel_root, listener).await
+                if let Err(e) = run_proxy(
+                    pools_task,
+                    host_task,
+                    go_port,
+                    map_task,
+                    cancel_root,
+                    listener,
+                )
+                .await
                 {
                     lerror!("listen on {}: {}", addr, e);
                 }
@@ -160,10 +171,16 @@ pub extern "C" fn StopProxy() -> c_int {
 
     let rt = runtime();
     let pools = state.pools.clone();
-    let handle = state.handle;
+    let mut handle = state.handle;
     rt.block_on(async move {
         linfo!("StopProxy: waiting for proxy tasks to finish (max 2s)");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
         linfo!("StopProxy: closing pool connections");
         pools.close_all().await;
         pools.reset().await;
@@ -175,7 +192,7 @@ pub extern "C" fn StopProxy() -> c_int {
     DC_FAIL_UNTIL.write().clear();
     IP_FAIL_UNTIL.write().clear();
     cfproxy::clear_cfproxy_429_cooldowns();
-    proxy::set_ws_pool_fronting_first(true);
+    proxy::set_ws_pool_fronting_first(false);
 
     linfo!("StopProxy: exit");
     0
@@ -263,6 +280,11 @@ pub extern "C" fn SetDisableSecure(v: c_int) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn SetH2Enabled(v: c_int) {
+    H2_MEDIA_ENABLED.store(v != 0, Ordering::Relaxed);
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn SetForceTestDc(v: c_int) {
     // --force-test-dc: весь трафик на тестовые DC.
     FORCE_TEST_DC.store(v != 0, Ordering::Relaxed);
@@ -302,7 +324,14 @@ pub extern "C" fn GetSecretWithPrefix() -> *mut c_char {
     let full = if ftls.is_empty() {
         format!("dd{}", sec)
     } else {
-        format!("ee{}{}", sec, ftls.as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>())
+        format!(
+            "ee{}{}",
+            sec,
+            ftls.as_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        )
     };
     CString::new(full).unwrap_or_default().into_raw()
 }

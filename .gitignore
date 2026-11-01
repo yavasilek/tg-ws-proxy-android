@@ -26,6 +26,8 @@ gradle/gradle-daemon-jvm.properties
 
 # Rust
 target/
+__pycache__/
+.venv/
 **/*.rs.bk
 
 # IDE / OS

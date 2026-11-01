@@ -42,6 +42,7 @@ class ProxyService : Service() {
     private var lastCfPriority: Boolean = true
     private var lastCfDomain: String = ""
     private var lastSecretKey: String = ""
+    private var lastEngineOptions: String = "{}"
 
     companion object {
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
@@ -55,6 +56,7 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_PRIORITY = "EXTRA_CFPROXY_PRIORITY"
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
+        const val EXTRA_ENGINE_OPTIONS = "EXTRA_ENGINE_OPTIONS"
         
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
@@ -92,7 +94,8 @@ class ProxyService : Service() {
                 val cfPriority = intent.getBooleanExtra(EXTRA_CFPROXY_PRIORITY, true)
                 val cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: ""
                 val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey)
+                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey,
+                    intent.getStringExtra(EXTRA_ENGINE_OPTIONS) ?: "{}")
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -105,7 +108,7 @@ class ProxyService : Service() {
                 // If we had saved params, try to restart
                 if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey)
+                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey, lastEngineOptions)
                 } else {
                     stopSelf()
                 }
@@ -132,7 +135,7 @@ class ProxyService : Service() {
 
     private fun startProxy(bindIp: String, port: Int, ips: String, poolSize: Int = 4,
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
-                           cfDomain: String = "", secretKey: String = "") {
+                           cfDomain: String = "", secretKey: String = "", engineOptions: String = "{}") {
         if (_isRunning.value || stopInProgress) return
         _isVerifiedRunning.value = false
 
@@ -145,6 +148,7 @@ class ProxyService : Service() {
         lastCfPriority = cfPriority
         lastCfDomain = cfDomain
         lastSecretKey = secretKey
+        lastEngineOptions = engineOptions
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
@@ -163,7 +167,7 @@ class ProxyService : Service() {
         acquireWakeLock()
         stopInProgress = false
         
-        // Start Go proxy in a separate thread with error handling
+        // Start Rust proxy in a separate thread with error handling
         Thread({
             val canObtainPort = isPortAvailable(bindIp, port)
             if (!canObtainPort) {
@@ -177,6 +181,15 @@ class ProxyService : Service() {
             }
 
             try {
+                val options = EngineOptions.fromJson(engineOptions)
+                check(options.isValid()) { "Invalid network settings" }
+                NativeProxy.setH2Enabled(options.h2)
+                NativeProxy.setDisableSecure(options.noSecure)
+                NativeProxy.setCfWorkerDomains(options.workers)
+                NativeProxy.setFakeTlsDomain(options.fakeTls.trim())
+                NativeProxy.setForceTestDc(options.testDc)
+                NativeProxy.setProxyProtocol(options.proxyProtocol)
+                NativeProxy.setBufferSizeKb(options.bufferKb)
                 NativeProxy.setPoolSize(poolSize)
                 NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
                 NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
@@ -288,7 +301,8 @@ class ProxyService : Service() {
                 cfEnabled = lastCfEnabled,
                 cfPriority = lastCfPriority,
                 cfDomain = lastCfDomain,
-                secretKey = lastSecretKey
+                secretKey = lastSecretKey,
+                engineOptions = lastEngineOptions
             )
         }
     }

@@ -127,4 +127,17 @@
     <string name="interval_never">Never</string>
     <string name="interval_hours">%1$d h</string>
     <string name="port_is_not_available">Port %1$d is in use, please try another one</string>
+    <string name="engine_options_title">Network engine - Flowseal %1$s</string>
+    <string name="engine_h2">HTTP/2 for media</string>
+    <string name="engine_h2_unavailable">HTTP/2 requires Cloudflare, TLS and production datacenters.</string>
+    <string name="engine_no_secure">Use port 80 for Cloudflare</string>
+    <string name="engine_workers">Cloudflare Worker domains</string>
+    <string name="engine_workers_help">Optional. Separate domains with spaces or commas.</string>
+    <string name="engine_fake_tls">Fake TLS domain</string>
+    <string name="engine_fake_tls_help">Optional ASCII domain. Changes the Telegram connection secret.</string>
+    <string name="invalid_network_settings">Check domain names and buffer size (4-4096 KB).</string>
+    <string name="engine_advanced">Advanced settings</string>
+    <string name="engine_test_dc">Use Telegram test datacenters</string>
+    <string name="engine_proxy_protocol">Require PROXY protocol v1</string>
+    <string name="engine_buffer_kb">Socket buffer, KB</string>
 </resources>

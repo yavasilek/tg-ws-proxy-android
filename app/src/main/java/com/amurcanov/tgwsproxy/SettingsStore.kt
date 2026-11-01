@@ -61,6 +61,9 @@ class SettingsStore(private val context: Context) {
         val DIRECT_DC_DEFAULTS_V2_MIGRATED = booleanPreferencesKey("direct_dc_defaults_v2_migrated")
     }
 
+    private val engineKey = stringPreferencesKey("engine_options_v1")
+    val engineOptions: Flow<EngineOptions> = context.dataStore.data.map { EngineOptions.fromJson(it[engineKey] ?: "{}") }
+    suspend fun saveEngineOptions(value: EngineOptions) { context.dataStore.edit { it[engineKey] = value.toJson() } }
     val isReady: Flow<Boolean> = context.dataStore.data.map { true }
     val isExperimentalMode: Flow<Boolean> = context.dataStore.data.map { it[Keys.IS_EXPERIMENTAL_MODE] ?: false }
     val themeMode: Flow<String> = context.dataStore.data.map { it[Keys.THEME_MODE] ?: "system" }

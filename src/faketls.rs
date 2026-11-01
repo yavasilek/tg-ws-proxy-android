@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
@@ -16,7 +17,6 @@ pub const TLS_RECORD_APPDATA: u8 = 0x17;
 const CLIENT_RANDOM_OFFSET: usize = 11;
 const CLIENT_RANDOM_LEN: usize = 32;
 const SESSION_ID_OFFSET: usize = 44;
-const SESSION_ID_LEN: usize = 32;
 
 const TIMESTAMP_TOLERANCE: i64 = 120;
 const TLS_APPDATA_MAX: usize = 16384;
@@ -28,8 +28,6 @@ const MASKING_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CCS_FRAME: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
 
 const SH_RANDOM_OFF: usize = 11;
-const SH_SESSID_OFF: usize = 44;
-const SH_PUBKEY_OFF: usize = 89;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -38,23 +36,62 @@ pub struct FakeTlsStream {
     pub write: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
-fn server_hello_template() -> Vec<u8> {
-    let mut v = Vec::with_capacity(128);
-    v.extend_from_slice(&[0x16, 0x03, 0x03, 0x00, 0x7a]);
-    v.extend_from_slice(&[0x02, 0x00, 0x00, 0x76]);
-    v.extend_from_slice(&[0x03, 0x03]);
-    v.extend_from_slice(&[0u8; 32]);
-    v.push(0x20);
-    v.extend_from_slice(&[0u8; 32]);
-    v.extend_from_slice(&[0x13, 0x01, 0x00]);
-    v.extend_from_slice(&[0x00, 0x2e, 0x00]);
-    v.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
-    v.extend_from_slice(&[0u8; 32]);
-    v.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
-    v
+#[derive(Default)]
+struct ClientHelloInfo {
+    suites: Vec<u16>,
+    hybrid: bool,
+}
+static PROFILED_APPDATA_LEN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn parse_client_hello(data: &[u8]) -> Option<ClientHelloInfo> {
+    fn word(d: &[u8], p: usize) -> Option<usize> {
+        Some(u16::from_be_bytes(d.get(p..p + 2)?.try_into().ok()?) as usize)
+    }
+    let mut p = 43;
+    p += 1 + *data.get(p)? as usize;
+    let len = word(data, p)?;
+    p += 2;
+    let suites = data
+        .get(p..p + len)?
+        .chunks_exact(2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]))
+        .collect();
+    p += len;
+    p += 1 + *data.get(p)? as usize;
+    let end = p + 2 + word(data, p)?;
+    p += 2;
+    if end > data.len() {
+        return None;
+    }
+    let mut hybrid = false;
+    while p + 4 <= end {
+        let kind = word(data, p)?;
+        let len = word(data, p + 2)?;
+        p += 4;
+        let ext = data.get(p..p + len)?;
+        if kind == 0x33 && ext.len() >= 2 {
+            let mut off = 2;
+            let end = (2 + word(ext, 0)?).min(ext.len());
+            while off + 4 <= end {
+                let group = word(ext, off)?;
+                let n = word(ext, off + 2)?;
+                off += 4;
+                if off + n > end {
+                    return None;
+                }
+                if group == 0x11ec && n == 1216 {
+                    hybrid = true;
+                }
+                off += n;
+            }
+        }
+        p += len;
+    }
+    Some(ClientHelloInfo { suites, hybrid })
 }
 
-fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<([u8; 32], [u8; 32], i64)> {
+fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<([u8; 32], Vec<u8>, i64)> {
     if data.len() < 43 {
         return None;
     }
@@ -78,7 +115,7 @@ fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<([u8; 32], [u8; 32]
     mac.update(&zeroed);
     let expected = mac.finalize().into_bytes();
 
-    if expected[..28] != client_random[..28] {
+    if expected[..28].ct_eq(&client_random[..28]).unwrap_u8() != 1 {
         return None;
     }
 
@@ -96,46 +133,136 @@ fn verify_client_hello(data: &[u8], secret: &[u8]) -> Option<([u8; 32], [u8; 32]
         return None;
     }
 
-    let mut session_id = [0u8; 32];
-    if data.len() >= SESSION_ID_OFFSET + SESSION_ID_LEN && data[43] == 0x20 {
-        session_id
-            .copy_from_slice(&data[SESSION_ID_OFFSET..SESSION_ID_OFFSET + SESSION_ID_LEN]);
+    let session_len = *data.get(43)? as usize;
+    if session_len > 32 {
+        return None;
     }
+    let session_id = data
+        .get(SESSION_ID_OFFSET..SESSION_ID_OFFSET + session_len)?
+        .to_vec();
 
     Some((client_random, session_id, timestamp))
 }
 
-fn build_server_hello(secret: &[u8], client_random: &[u8; 32], session_id: &[u8; 32]) -> Vec<u8> {
-    let mut sh = server_hello_template();
-    debug_assert_eq!(sh.len(), 128);
-    sh[SH_SESSID_OFF..SH_SESSID_OFF + 32].copy_from_slice(session_id);
-
-    let mut pubkey = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut pubkey);
-    sh[SH_PUBKEY_OFF..SH_PUBKEY_OFF + 32].copy_from_slice(&pubkey);
-
-    let mut response = Vec::with_capacity(128 + 6 + 5 + 2100);
-    response.extend_from_slice(&sh);
+fn build_server_hello(
+    secret: &[u8],
+    client_random: &[u8; 32],
+    session_id: &[u8],
+    info: &ClientHelloInfo,
+) -> Vec<u8> {
+    let private = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+    let public = x25519_dalek::PublicKey::from(&private);
+    let mut key = Vec::new();
+    let group: u16 = if info.hybrid {
+        key.resize(1088, 0);
+        rand::thread_rng().fill_bytes(&mut key);
+        0x11ec
+    } else {
+        0x001d
+    };
+    key.extend_from_slice(public.as_bytes());
+    let suite = [0x1301u16, 0x1303, 0x1302]
+        .into_iter()
+        .find(|v| info.suites.contains(v))
+        .unwrap_or(0x1301);
+    let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x33];
+    extensions.extend_from_slice(&((4 + key.len()) as u16).to_be_bytes());
+    extensions.extend_from_slice(&group.to_be_bytes());
+    extensions.extend_from_slice(&(key.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&key);
+    let mut body = vec![0x03, 0x03];
+    body.extend_from_slice(&[0; 32]);
+    body.push(session_id.len() as u8);
+    body.extend_from_slice(session_id);
+    body.extend_from_slice(&suite.to_be_bytes());
+    body.push(0);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+    let mut handshake = vec![
+        2,
+        ((body.len() >> 16) & 255) as u8,
+        ((body.len() >> 8) & 255) as u8,
+        body.len() as u8,
+    ];
+    handshake.extend_from_slice(&body);
+    let mut response = vec![0x16, 0x03, 0x03];
+    response.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    response.extend_from_slice(&handshake);
     response.extend_from_slice(&CCS_FRAME);
-
-    let encrypted_size = 1900 + (rand::thread_rng().next_u32() % 201) as usize;
-    let mut encrypted_data = vec![0u8; encrypted_size];
-    rand::thread_rng().fill_bytes(&mut encrypted_data);
-    response.push(TLS_RECORD_APPDATA);
-    response.push(0x03);
-    response.push(0x03);
-    response.push((encrypted_size >> 8) as u8);
-    response.push(encrypted_size as u8);
-    response.extend_from_slice(&encrypted_data);
-
+    let profile = PROFILED_APPDATA_LEN.load(Ordering::Relaxed);
+    let size = if profile == 0 {
+        64 + (rand::thread_rng().next_u32() % 97) as usize
+    } else {
+        profile.clamp(64, TLS_APPDATA_MAX)
+    };
+    response.extend_from_slice(&[0x17, 0x03, 0x03]);
+    response.extend_from_slice(&(size as u16).to_be_bytes());
+    let off = response.len();
+    response.resize(off + size, 0);
+    rand::thread_rng().fill_bytes(&mut response[off..]);
     let mut mac = HmacSha256::new_from_slice(secret).unwrap();
     mac.update(client_random);
     mac.update(&response);
-    let server_random = mac.finalize().into_bytes();
+    response[SH_RANDOM_OFF..SH_RANDOM_OFF + 32].copy_from_slice(&mac.finalize().into_bytes());
+    response
+}
 
-    let mut final_bytes = response;
-    final_bytes[SH_RANDOM_OFF..SH_RANDOM_OFF + 32].copy_from_slice(&server_random);
-    final_bytes
+fn first_appdata_record_len(data: &[u8]) -> Option<usize> {
+    let mut p = 0;
+    while p + 5 <= data.len() {
+        let n = u16::from_be_bytes([data[p + 3], data[p + 4]]) as usize;
+        match data[p] {
+            TLS_RECORD_APPDATA => return Some(n),
+            TLS_RECORD_HANDSHAKE | TLS_RECORD_CCS => {}
+            _ => return Some(0),
+        }
+        p += 5 + n;
+    }
+    None
+}
+
+pub async fn profile_masking_site(domain: &str) {
+    PROFILED_APPDATA_LEN.store(0, Ordering::Relaxed);
+    if domain.is_empty() {
+        return;
+    }
+    let probe = async {
+        let name = rustls_pki_types::ServerName::try_from(domain.to_string()).ok()?;
+        let mut cfg = crate::ws::tls_config(false, false);
+        cfg.enable_sni = true;
+        let mut hello = rustls::ClientConnection::new(std::sync::Arc::new(cfg), name).ok()?;
+        let mut initial = Vec::new();
+        hello.write_tls(&mut initial).ok()?;
+        let addresses = tokio::net::lookup_host((domain, 443)).await.ok()?;
+        let addr = addresses
+            .into_iter()
+            .find(|a| !a.ip().is_loopback() && !a.ip().is_unspecified())?;
+        let mut stream = TcpStream::connect(addr).await.ok()?;
+        stream.write_all(&initial).await.ok()?;
+        let mut data = Vec::new();
+        let mut buf = [0u8; 16384];
+        while data.len() < 128 * 1024 {
+            let n = stream.read(&mut buf).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buf[..n]);
+            if let Some(n) = first_appdata_record_len(&data) {
+                return if n > 0 { Some(n) } else { None };
+            }
+        }
+        None
+    };
+    match tokio::time::timeout(Duration::from_secs(5), probe).await {
+        Ok(Some(n)) => {
+            PROFILED_APPDATA_LEN.store(n.clamp(64, TLS_APPDATA_MAX), Ordering::Relaxed);
+            log_debug(&format!(
+                "Fake TLS profile: first encrypted record {} bytes",
+                n
+            ));
+        }
+        _ => log_warn("Fake TLS profile unavailable; using bounded random record sizes"),
+    }
 }
 
 fn wrap_tls_record(data: &[u8]) -> Vec<u8> {
@@ -358,7 +485,10 @@ pub async fn server_handshake(
     match verify_client_hello(&client_hello, secret) {
         Some((client_random, session_id, ts)) => {
             log_debug(&format!("[{}] Fake TLS handshake ok (ts={})", label, ts));
-            let server_hello = build_server_hello(secret, &client_random, &session_id);
+            let info = parse_client_hello(&client_hello).unwrap_or_default();
+            let delay_ms = 8 + (rand::thread_rng().next_u32() % 17) as u64;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let server_hello = build_server_hello(secret, &client_random, &session_id, &info);
             if conn.write_all(&server_hello).await.is_err() {
                 return None;
             }
@@ -401,9 +531,7 @@ async fn proxy_to_masking_domain(conn: TcpStream, initial: Vec<u8>, domain: &str
     };
 
     log_debug(&format!("[{}] masking -> {}:443", label, domain));
-    STATS
-        .connections_masked
-        .fetch_add(1, Ordering::Relaxed);
+    STATS.connections_masked.fetch_add(1, Ordering::Relaxed);
 
     let mut upstream = upstream;
     if upstream.write_all(&initial).await.is_err() {
@@ -423,4 +551,50 @@ async fn proxy_to_masking_domain(conn: TcpStream, initial: Vec<u8>, domain: &str
     });
 
     let _ = tokio::join!(up, down);
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn server_hello_mirrors_hybrid_and_authenticates_all_records() {
+        let secret = [9u8; 16];
+        let random = [7u8; 32];
+        let session = [5u8; 32];
+        let response = build_server_hello(
+            &secret,
+            &random,
+            &session,
+            &ClientHelloInfo {
+                suites: vec![0x1303],
+                hybrid: true,
+            },
+        );
+        let handshake_end = 5 + u16::from_be_bytes([response[3], response[4]]) as usize;
+        assert_eq!(&response[76..78], &0x1303u16.to_be_bytes());
+        assert!(response[..handshake_end]
+            .windows(4)
+            .any(|w| w == [0x11, 0xec, 0x04, 0x60]));
+        assert_eq!(&response[handshake_end..handshake_end + 6], &CCS_FRAME);
+        let mut zeroed = response.clone();
+        zeroed[11..43].fill(0);
+        let mut mac = HmacSha256::new_from_slice(&secret).unwrap();
+        mac.update(&random);
+        mac.update(&zeroed);
+        assert_eq!(&response[11..43], mac.finalize().into_bytes().as_slice());
+        let n = first_appdata_record_len(&response).unwrap();
+        assert!((64..=160).contains(&n));
+    }
+    #[test]
+    fn profile_parser_handles_fragmented_and_invalid_flights() {
+        assert_eq!(first_appdata_record_len(&[0x16, 3, 3, 0]), None);
+        assert_eq!(
+            first_appdata_record_len(&[0x16, 3, 3, 0, 2, 1, 2, 0x17, 3, 3, 1, 44]),
+            Some(300)
+        );
+        assert_eq!(first_appdata_record_len(&[0x15, 3, 3, 0, 2]), Some(0));
+        for n in 0..100 {
+            assert!(parse_client_hello(&vec![0; n]).is_none() || n >= 49);
+        }
+    }
 }

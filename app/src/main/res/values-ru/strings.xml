@@ -127,4 +127,17 @@
     <string name="interval_never">Никогда</string>
     <string name="interval_hours">%1$d ч</string>
     <string name="port_is_not_available">"Порт %1$d используется, пожалуйста попробуйте другой "</string>
+    <string name="engine_options_title">Сетевой движок - Flowseal %1$s</string>
+    <string name="engine_h2">HTTP/2 для медиатрафика</string>
+    <string name="engine_h2_unavailable">HTTP/2 требует Cloudflare, TLS и обычные датацентры.</string>
+    <string name="engine_no_secure">Порт 80 для Cloudflare</string>
+    <string name="engine_workers">Домены Cloudflare Worker</string>
+    <string name="engine_workers_help">Необязательно. Разделяйте домены пробелами или запятыми.</string>
+    <string name="engine_fake_tls">Домен Fake TLS</string>
+    <string name="engine_fake_tls_help">Необязательный ASCII-домен. Меняет секрет подключения Telegram.</string>
+    <string name="invalid_network_settings">Проверьте домены и размер буфера (4-4096 КБ).</string>
+    <string name="engine_advanced">Дополнительные настройки</string>
+    <string name="engine_test_dc">Тестовые датацентры Telegram</string>
+    <string name="engine_proxy_protocol">Требовать PROXY protocol v1</string>
+    <string name="engine_buffer_kb">Буфер сокета, КБ</string>
 </resources>

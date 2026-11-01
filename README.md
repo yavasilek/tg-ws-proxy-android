@@ -1,17 +1,59 @@
+# Поддерживаемый Android-форк на Rust
+
+Перенос сетевых изменений Flowseal 1.11.3 и main до `50d539c` от 31.10.2026.
+Android 5+ для 32-битной ARM-сборки, Android 7+ для arm64. Python в APK отсутствует.
+Список перенесённых изменений и порядок обновления: [UPSTREAM.md](UPSTREAM.md).
+
+Добавлены HTTP/2 для медиатрафика, актуальный Fake TLS и настройки ядра. Исправлены
+пулы соединений, TLS-проверка, backoff и остановка фоновых задач. Автообновление
+смотрит релизы [этого форка](https://github.com/yavasilek/tg-ws-proxy-android/releases).
+Приложение устанавливается отдельно от оригинального Android-форка.
+
+## Сборка и проверка
+
+Нужны Rust stable, JDK 21, Android SDK 36 и NDK 28.2.13676358.
+Windows также требует Visual Studio C++ Build Tools или LLVM-MinGW.
+При использовании LLVM-MinGW установите также `stable-x86_64-pc-windows-gnu`
+через `rustup toolchain install stable-x86_64-pc-windows-gnu`.
+
+```powershell
+rustup target add aarch64-linux-android armv7-linux-androideabi
+.\tools\build-native.ps1
+.\gradlew.bat :app:assembleArm64Debug :app:assembleArm32Debug :app:assembleUniversalDebug
+cargo test --locked --lib
+```
+
+Библиотеки `jniLibs` собираются из исходников. На Linux сборка полностью описана в
+[GitHub Actions](.github/workflows/android.yml). POSIX-обёртка `gradlew` включена.
+Если JBR на Windows сообщает `Unable to establish loopback connection`, задайте
+`JAVA_TOOL_OPTIONS=-Djdk.net.unixdomain.tmpdir=C:/Windows/Temp` для текущего процесса.
+
+Для instrumentation на x86_64-эмуляторе добавьте цель `x86_64-linux-android`,
+соберите её через `tools/build-native.ps1 -Targets x86_64-linux-android` и запустите
+`gradlew.bat :app:connectedEmulatorDebugAndroidTest`.
+
+Release-сборка без собственного keystore остаётся неподписанной. Для локального
+теста уменьшенного APK можно явно передать `-PdevelopmentSigning=true`: он будет
+подписан отладочным ключом. Этот режим не используется для публичного релиза.
+
+Исходное описание Android-проекта и авторство сохранены ниже.
+
+---
+
 <div align="center">
   
   # Telegram WS Proxy Android
 <br>
   <img src="https://img.shields.io/badge/Android-SDK_24--36-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android SDK">
-  <img src="https://img.shields.io/badge/Rust-1.70+-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust Version">
+  <img src="https://img.shields.io/badge/Rust-stable-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust Version">
   <img src="https://img.shields.io/badge/Kotlin-Native-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin">
-  <a href="https://github.com/amurcanov/tg-ws-proxy-android/stargazers">
-    <img src="https://img.shields.io/github/stars/amurcanov/tg-ws-proxy-android?style=for-the-badge&logo=github&color=ffca28&labelColor=24292e" alt="Stars">
+  <a href="https://github.com/yavasilek/tg-ws-proxy-android/stargazers">
+    <img src="https://img.shields.io/github/stars/yavasilek/tg-ws-proxy-android?style=for-the-badge&logo=github&color=ffca28&labelColor=24292e" alt="Stars">
   </a>
 </div>
 <br>
 
-**TG WS Proxy Android** — это локальный **MTProto-прокси** для Telegram на Android. Приложение помогает частично решать проблемы и в ряде сценариев ускоряет работу мессенджера, перенаправляя трафик через защищённые CloudFlare WebSocket-соединения или напрямую к датацентрам Telegram.
+**TG WS Proxy Android** - это локальный **MTProto-прокси** для Telegram на Android. Приложение помогает частично решать проблемы и в ряде сценариев ускоряет работу мессенджера, перенаправляя трафик через защищённые CloudFlare WebSocket-соединения или напрямую к датацентрам Telegram.
 
 ---
 
@@ -24,7 +66,7 @@
 - **Фоновый режим:** используется `Foreground Service`, уведомление о работе сервиса и дополнительная логика удержания соединения, чтобы Android не выгружал прокси слишком агрессивно.
 - **Лог-вьюер:** встроенный просмотр событий в реальном времени помогает быстро понять, что происходит с подключением, маршрутом и пулом соединений.
 - **Темы и палитры:** поддерживаются Dynamic Colors на Android 12+, а также встроенные палитры для более старых устройств.
-- **Авто-обновления внутри приложения:** вручную проверять релизы больше не нужно — когда выйдет новая версия, приложение само покажет уведомление об обновлении.
+- **Авто-обновления внутри приложения:** вручную проверять релизы больше не нужно - когда выйдет новая версия, приложение само покажет уведомление об обновлении.
 - **Раздел «Информация»:** внутри приложения есть расширенная справка по настройкам, особенностям CloudFlare, пулу WS-соединений и ручной конфигурации датацентров.
 
 ---
@@ -42,12 +84,12 @@ Telegram Android → Локальный MTProto (по умолчанию 127.0.0
 
 ## Быстрый старт
 
-1. Скачайте актуальный `APK` со **[страницы релизов](https://github.com/amurcanov/tg-ws-proxy-android/releases)**.
+1. Скачайте тестовый APK из [артефактов Actions](https://github.com/yavasilek/tg-ws-proxy-android/actions) или соберите локально. Публичные релизы этого форка пока не выпущены.
 2. Установите приложение на ваш Android-смартфон.
 3. Откройте **TG WS Proxy Android**.
 4. Ознакомьтесь со справкой внутри приложения.
-5. Нажмите **«Запустить прокси»** — появится уведомление о работе в фоновом режиме.
-6. Нажмите **«Применить в Telegram»** — откроется Telegram-клиент, где останется только подтвердить подключение.
+5. Нажмите **«Запустить прокси»** - появится уведомление о работе в фоновом режиме.
+6. Нажмите **«Применить в Telegram»** - откроется Telegram-клиент, где останется только подтвердить подключение.
 
 ---
 

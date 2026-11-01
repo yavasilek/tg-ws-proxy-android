@@ -40,7 +40,7 @@ if "%MISSING%"=="1" (
 
 echo Incremental build...
 echo Building release APKs...
-call gradlew assembleRelease --no-daemon
+call gradlew :app:assembleArm64Release :app:assembleArm32Release :app:assembleUniversalRelease --no-daemon
 
 if %errorlevel% neq 0 (
     echo.

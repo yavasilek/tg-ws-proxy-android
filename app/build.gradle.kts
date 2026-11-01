@@ -7,13 +7,14 @@ plugins {
 
 android {
     namespace = "com.amurcanov.tgwsproxy"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.amurcanov.tgwsproxy"
+        applicationId = "com.yavasilek.tgwsproxy"
         targetSdk = 35
-        versionCode = 123
-        versionName = "1.2.3"
+        versionCode = 130
+        versionName = "1.3.0"
+        buildConfigField("String", "UPSTREAM_VERSION", "\"1.11.3\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -47,6 +48,12 @@ android {
                 abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
             }
         }
+    }
+
+    productFlavors.create("emulator") {
+        dimension = "arch"
+        minSdk = 24
+        ndk { abiFilters.add("x86_64") }
     }
 
     val localProperties = Properties()
@@ -100,7 +107,12 @@ android {
                 signingConfig = signingConfigs.getByName("release")
                 println("✅ Signing config applied: ${resolvedFile.absolutePath}")
             } else {
-                println("⚠️ WARNING: Keystore not found, using debug signing")
+                if (providers.gradleProperty("developmentSigning").orNull == "true") {
+                    signingConfig = signingConfigs.getByName("debug")
+                    println("Development release: signed with the local debug key")
+                } else {
+                    println("Release APK will be unsigned: no keystore configured")
+                }
                 println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
             }
         }
@@ -141,8 +153,10 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
     // JNA for easy C-shared library calls
-    implementation("net.java.dev.jna:jna:5.14.0@aar")
+    implementation("net.java.dev.jna:jna:5.19.1@aar")
     debugImplementation("com.squareup.leakcanary:leakcanary-android:2.14")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.appcompat:appcompat:1.6.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }

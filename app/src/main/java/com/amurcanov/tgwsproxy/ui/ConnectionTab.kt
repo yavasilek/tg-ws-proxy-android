@@ -55,6 +55,7 @@ fun ConnectionTab(settingsStore: SettingsStore) {
     val savedPort by settingsStore.port.collectAsStateWithLifecycle(initialValue = "1443")
     val savedBindIp by settingsStore.bindIp.collectAsStateWithLifecycle(initialValue = "127.0.0.1")
     val savedCfEnabled by settingsStore.cfproxyEnabled.collectAsStateWithLifecycle(initialValue = true)
+    val engineOptions by settingsStore.engineOptions.collectAsStateWithLifecycle(initialValue = com.amurcanov.tgwsproxy.EngineOptions())
     val savedPoolSize by settingsStore.poolSize.collectAsStateWithLifecycle(initialValue = 4)
     val savedSecretKey by settingsStore.secretKey.collectAsStateWithLifecycle(initialValue = "LOADING")
 
@@ -101,7 +102,9 @@ fun ConnectionTab(settingsStore: SettingsStore) {
         if (raw.isNotEmpty() && raw != "LOADING") raw else "00000000000000000000000000000000"
     }
     val bindIp = savedBindIp.trim().takeIf { it.isNotEmpty() } ?: "127.0.0.1"
-    val proxyUrl = "https://t.me/proxy?server=$bindIp&port=$port&secret=dd$secretForUrl"
+    val fullSecret = if (engineOptions.fakeTls.isBlank()) "dd$secretForUrl" else
+        "ee$secretForUrl" + engineOptions.fakeTls.trim().toByteArray(Charsets.US_ASCII).joinToString("") { "%02x".format(it.toInt() and 255) }
+    val proxyUrl = "https://t.me/proxy?server=$bindIp&port=$port&secret=$fullSecret"
     
     var applyMode by rememberSaveable { mutableStateOf("packages") }
 

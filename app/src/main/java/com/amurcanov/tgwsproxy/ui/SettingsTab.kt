@@ -443,6 +443,8 @@ fun SettingsTab(settingsStore: SettingsStore) {
         }
 
         Spacer(Modifier.height(12.dp))
+        EngineSettingsSection(settingsStore, isRunning, cfEnabled)
+        Spacer(Modifier.height(12.dp))
     }
 }
 

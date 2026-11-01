@@ -16,7 +16,7 @@ object ProxyController {
         settingsStore.migrateLegacyDefaults()
         val portText = settingsStore.port.first()
         val port = portText.toIntOrNull()
-        if (port == null) {
+        if (port == null || port !in 1..65535) {
             if (showInvalidPortToast) {
                 Toast.makeText(context, context.getString(R.string.invalid_port), Toast.LENGTH_SHORT).show()
             }
@@ -24,6 +24,11 @@ object ProxyController {
             return false
         }
 
+        val engineOptions = settingsStore.engineOptions.first()
+        if (!engineOptions.isValid()) {
+            if (showInvalidPortToast) Toast.makeText(context, R.string.invalid_network_settings, Toast.LENGTH_LONG).show()
+            return false
+        }
         val bindIp = settingsStore.bindIp.first()
         val isExperimental = settingsStore.isExperimentalMode.first()
         val isDcAuto = settingsStore.isDcAuto.first()
@@ -57,6 +62,7 @@ object ProxyController {
             context,
             Intent(context, ProxyService::class.java).apply {
                 action = ProxyService.ACTION_START
+                putExtra(ProxyService.EXTRA_ENGINE_OPTIONS, engineOptions.toJson())
                 putExtra(ProxyService.EXTRA_BIND_IP, bindIp)
                 putExtra(ProxyService.EXTRA_PORT, port)
                 putExtra(ProxyService.EXTRA_IPS, parsedIps)

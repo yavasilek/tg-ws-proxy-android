@@ -1,6 +1,6 @@
 use crate::config::*;
 use crate::crypto::xor_mask_in_place;
-use crate::{ldebug};
+use crate::ldebug;
 use base64::Engine;
 use byteorder::{BigEndian, ByteOrder};
 use rand::RngCore;
@@ -31,74 +31,77 @@ pub const OP_PONG: u8 = 0xA;
 pub const MAX_MESSAGE_LEN: u64 = 16 * 1024 * 1024;
 const MAX_FRAME_PAYLOAD: u64 = 16 * 1024 * 1024;
 
-// ---------------------------------------------------------------------------
-// TLS config: InsecureSkipVerify + session cache (как в Go)
-// ---------------------------------------------------------------------------
-
+// TLS roots and signature validation match upstream's certifi SSL contexts.
 #[derive(Debug)]
-struct NoVerify;
-
-impl ServerCertVerifier for NoVerify {
+struct FrontingVerifier(Arc<rustls::client::WebPkiServerVerifier>);
+impl ServerCertVerifier for FrontingVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        cert: &CertificateDer<'_>,
+        chain: &[CertificateDer<'_>],
+        name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
+        match self.0.verify_server_cert(cert, chain, name, ocsp, now) {
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName))
+            | Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForNameContext { .. },
+            )) => Ok(ServerCertVerified::assertion()),
+            result => result,
+        }
     }
-
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        msg: &[u8],
+        cert: &CertificateDer<'_>,
+        sig: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.0.verify_tls12_signature(msg, cert, sig)
     }
-
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        msg: &[u8],
+        cert: &CertificateDer<'_>,
+        sig: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        self.0.verify_tls13_signature(msg, cert, sig)
     }
-
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-        ]
+        self.0.supported_verify_schemes()
     }
 }
 
 use once_cell::sync::Lazy;
-
-// Глобальный TLS-конфиг с session resumption cache (аналог tls.NewLRUClientSessionCache(100))
-static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
-    let mut cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
+pub fn tls_config(fronting: bool, h2: bool) -> ClientConfig {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    // ring has no hybrid PQ group; this also avoids the oversized ClientHello fixed in v1.11.3.
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups = vec![rustls::crypto::ring::kx_group::X25519];
+    let builder = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions");
+    let mut cfg = if fronting {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(FrontingVerifier(
+                rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                    .build()
+                    .expect("root store"),
+            )))
+            .with_no_client_auth()
+    } else {
+        builder.with_root_certificates(roots).with_no_client_auth()
+    };
     cfg.resumption = rustls::client::Resumption::in_memory_sessions(100);
-    Arc::new(cfg)
-});
-
-// Отдельный контекст для fronting (check_hostname=False в оригинале).
-// На практике оба контекста NoVerify; разделение сохранено для паритета.
-static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> = Lazy::new(|| TLS_CONFIG.clone());
+    if h2 {
+        cfg.alpn_protocols = vec![b"h2".to_vec()];
+    }
+    cfg
+}
+static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| Arc::new(tls_config(false, false)));
+static TLS_CONFIG_FRONTING: Lazy<Arc<ClientConfig>> =
+    Lazy::new(|| Arc::new(tls_config(true, false)));
 
 // ---------------------------------------------------------------------------
 // WsHandshakeError
@@ -220,7 +223,8 @@ impl RawWebSocket {
         let mut writer = self.writer.lock().await;
         for part in parts {
             let frame = build_frame(OP_BINARY, part, true);
-            let res = tokio::time::timeout(WS_WRITE_TIMEOUT, write_all_match(&mut writer, &frame)).await;
+            let res =
+                tokio::time::timeout(WS_WRITE_TIMEOUT, write_all_match(&mut writer, &frame)).await;
             match res {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
@@ -284,7 +288,11 @@ impl RawWebSocket {
                 OP_CLOSE => {
                     self.closed.store(true, Ordering::Relaxed);
                     let (code, reason) = parse_close(&payload);
-                    ldebug!("WS OP_CLOSE from upstream: code={:?} reason={:?}", code, reason);
+                    ldebug!(
+                        "WS OP_CLOSE from upstream: code={:?} reason={:?}",
+                        code,
+                        reason
+                    );
                     let mut close_payload = payload;
                     if close_payload.len() > 2 {
                         close_payload.truncate(2);
@@ -632,8 +640,7 @@ async fn handshake_tls(
         Err(_) => return Err(WsError::Timeout),
     }
     let mut bufreader = BufReader::with_capacity(4096, read_half);
-    let (status_code, first_line, headers) =
-        read_http_response(&mut bufreader, timeout).await?;
+    let (status_code, first_line, headers) = read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
             reader: tokio::sync::Mutex::new(WsReader::Tls(bufreader)),
@@ -672,8 +679,7 @@ async fn handshake_plain(
         Err(_) => return Err(WsError::Timeout),
     }
     let mut bufreader = BufReader::with_capacity(4096, read_half);
-    let (status_code, first_line, headers) =
-        read_http_response(&mut bufreader, timeout).await?;
+    let (status_code, first_line, headers) = read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
             reader: tokio::sync::Mutex::new(WsReader::Plain(bufreader)),
@@ -817,20 +823,24 @@ pub async fn ws_connect_once_full(
     let sni_server = server_name(sni_name);
 
     let handshake_timeout = ws_handshake_timeout(timeout);
-    let tls_conn =
-        match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                if e.kind() != std::io::ErrorKind::ConnectionReset {
-                    ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
-                }
-                return Err(WsError::Io(e));
+    let tls_conn = match tokio::time::timeout(
+        handshake_timeout,
+        connector.connect(sni_server, raw_conn),
+    )
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            if e.kind() != std::io::ErrorKind::ConnectionReset {
+                ldebug!(" ws tls fail {} via {}: {}", domain, dial_addr, e);
             }
-            Err(_) => {
-                ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
-                return Err(WsError::Timeout);
-            }
-        };
+            return Err(WsError::Io(e));
+        }
+        Err(_) => {
+            ldebug!(" ws tls fail {} via {}: timeout", domain, dial_addr);
+            return Err(WsError::Timeout);
+        }
+    };
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
     handshake_tls(read_half, write_half, domain, path, timeout).await
@@ -898,36 +908,38 @@ pub async fn connect_one_ws_full(
     path: &str,
     timeout: f64,
 ) -> Option<RawWebSocket> {
-    // Поведение pool._connect_one: сначала fronting (sni=sprinthost.ru),
-    // затем обычное соединение; Timeout/Reset → fronting fallback.
     let fronting_first = crate::proxy::ws_pool_fronting_first();
-    for d in domains {
-        if fronting_first {
-            if let Some(ws) = connect_fronted(ip, d, path).await {
-                return Some(ws);
-            }
-        }
-        match ws_connect_full_opts(ip, d, path, timeout, None, Some(true)).await {
-            Ok(ws) => {
-                crate::proxy::set_ws_pool_fronting_first(false);
-                return Some(ws);
-            }
-            Err(WsError::Timeout) | Err(WsError::Io(_)) => {
-                if fronting_first {
-                    // как в оригинале: при fronting-first таймаут → сразу fronted
-                    return connect_fronted(ip, d, path).await;
-                }
-                if let Some(ws) = connect_fronted(ip, d, path).await {
+    for domain in domains {
+        for fronted in if fronting_first {
+            [true, false]
+        } else {
+            [false, true]
+        } {
+            let result = ws_connect_full_opts(
+                ip,
+                domain,
+                path,
+                if fronted {
+                    WS_POOL_FRONTING_TIMEOUT
+                } else {
+                    timeout
+                },
+                if fronted { Some(FRONTING_SNI) } else { None },
+                Some(true),
+            )
+            .await;
+            match result {
+                Ok(ws) => {
+                    crate::proxy::set_ws_pool_fronting_first(fronted);
+                    if fronted {
+                        STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Some(ws);
                 }
-            }
-            Err(WsError::Handshake(h)) => {
-                if h.is_redirect() {
-                    continue;
+                Err(_) => {
+                    STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                 }
-                return None;
             }
-            Err(_) => return None,
         }
     }
     None
@@ -935,12 +947,42 @@ pub async fn connect_one_ws_full(
 
 pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWebSocket> {
     let path = if path.is_empty() { WS_PATH } else { path };
-    match ws_connect_full_opts(ip, domain, path, WS_POOL_FRONTING_TIMEOUT, Some(FRONTING_SNI), Some(true)).await {
+    match ws_connect_full_opts(
+        ip,
+        domain,
+        path,
+        WS_POOL_FRONTING_TIMEOUT,
+        Some(FRONTING_SNI),
+        Some(true),
+    )
+    .await
+    {
         Ok(ws) => {
             STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
             crate::proxy::set_ws_pool_fronting_first(true);
             Some(ws)
         }
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tls_regression_tests {
+    use super::*;
+    #[test]
+    fn fronting_still_rejects_invalid_certificate_chains() {
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let verifier = FrontingVerifier(
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                .build()
+                .unwrap(),
+        );
+        let invalid = CertificateDer::from(vec![0u8; 16]);
+        let name = ServerName::try_from("example.com").unwrap();
+        assert!(verifier
+            .verify_server_cert(&invalid, &[], &name, &[], UnixTime::now())
+            .is_err());
+        assert!(!verifier.supported_verify_schemes().is_empty());
     }
 }

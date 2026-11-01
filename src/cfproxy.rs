@@ -171,7 +171,11 @@ pub fn mark_cfproxy_429_cooldown(domain: &str, err: &WsError) {
         },
     );
     drop(map);
-    ldebug!(" CF cooldown {}: {:.0}s after 429", d, delay.as_secs_f64().ceil());
+    ldebug!(
+        " CF cooldown {}: {:.0}s after 429",
+        d,
+        delay.as_secs_f64().ceil()
+    );
 }
 
 pub fn cfproxy_429_cooldown_remaining(domain: &str) -> Duration {
@@ -228,8 +232,6 @@ fn load_cfproxy_domains_from_cache() -> Vec<String> {
     merge_cfproxy_domains(&[list])
 }
 
-
-
 fn save_cfproxy_domains_to_cache(domains: &[String]) {
     let path = match cfproxy_cache_path() {
         Some(p) => p,
@@ -250,8 +252,6 @@ fn save_cfproxy_domains_to_cache(domains: &[String]) {
     }
 }
 
-
-
 fn should_refresh_cfproxy_domains() -> bool {
     let path = match cfproxy_cache_path() {
         Some(p) => p,
@@ -271,8 +271,6 @@ fn should_refresh_cfproxy_domains() -> bool {
     }
 }
 
-
-
 pub fn init_cfproxy_domains() {
     let defaults = default_cfproxy_domains();
     let cached = load_cfproxy_domains_from_cache();
@@ -281,23 +279,29 @@ pub fn init_cfproxy_domains() {
     if !cfg.user_domain.is_empty() {
         let ud = cfg.user_domain.clone();
         cfg.domains = vec![ud.clone()];
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&cfg.domains);
         return;
     }
 
     if !cached.is_empty() {
         let n = cached.len();
         cfg.domains = merge_cfproxy_domains(&[cached, defaults]);
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&cfg.domains);
         drop(cfg);
         linfo!(" CF: кеш доменов загружен ({} шт.)", n);
     } else {
         cfg.domains = defaults;
-        crate::balancer::BALANCER.write().update_domains_list(&cfg.domains);
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&cfg.domains);
     }
 }
 
-pub fn start_cfproxy_refresh() {
+pub fn start_cfproxy_refresh(cancel: tokio_util::sync::CancellationToken) {
     // Порт proxy/config.py::start_cfproxy_domain_refresh: сначала пробуем
     // обновить сразу (до 3 попыток), затем раз в час фоновым таском.
     // На мобиле уважаем свежесть дискового кеша для первой попытки.
@@ -305,21 +309,24 @@ pub fn start_cfproxy_refresh() {
         ldebug!(" CF: кеш свежий, откладываю обновление списка на час");
     }
     tokio::spawn(async move {
-        if should_refresh_cfproxy_domains() {
-            for _ in 0..3 {
-                if try_refresh_cfproxy_domains().await {
-                    break;
+        let refresh = async {
+            if should_refresh_cfproxy_domains() {
+                for _ in 0..3 {
+                    if try_refresh_cfproxy_domains().await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                if CFPROXY.read().domains.is_empty() {
+                    ldebug!(" CF: обновить список доменов не удалось, остаюсь на кеше/встроенном списке");
+                }
             }
-            if CFPROXY.read().domains.is_empty() {
-                ldebug!(" CF: обновить список доменов не удалось, остаюсь на кеше/встроенном списке");
+            loop {
+                tokio::time::sleep(CFPROXY_REFRESH_INTERVAL).await;
+                try_refresh_cfproxy_domains().await;
             }
-        }
-        loop {
-            tokio::time::sleep(CFPROXY_REFRESH_INTERVAL).await;
-            try_refresh_cfproxy_domains().await;
-        }
+        };
+        tokio::select! { _=cancel.cancelled()=>{}, _=refresh=>{} }
     });
 }
 
@@ -341,9 +348,7 @@ pub async fn try_refresh_cfproxy_domains() -> bool {
     let nonce: String = {
         use rand::Rng;
         let mut rng = rand::thread_rng();
-        (0..7)
-            .map(|_| rng.gen_range(b'a'..=b'z') as char)
-            .collect()
+        (0..7).map(|_| rng.gen_range(b'a'..=b'z') as char).collect()
     };
     let url = format!("{}?{}", CFPROXY_DOMAINS_URL, nonce);
     let resp = match client
@@ -392,7 +397,9 @@ pub async fn try_refresh_cfproxy_domains() -> bool {
             }
             cfg.domains = merged.clone();
         }
-        crate::balancer::BALANCER.write().update_domains_list(&merged);
+        crate::balancer::BALANCER
+            .write()
+            .update_domains_list(&merged);
         save_cfproxy_domains_to_cache(&merged);
         linfo!(" CF: список доменов обновлен ({} шт.)", pool.len());
         return true;
@@ -504,11 +511,9 @@ pub async fn resolve_doh(domain: &str) -> Option<String> {
         let tx = tx.clone();
         tasks.push(tokio::spawn(async move {
             let host = format!("{}:443", domain2);
-            if let Ok(Ok(addrs)) = tokio::time::timeout(
-                Duration::from_millis(1500),
-                tokio::net::lookup_host(host),
-            )
-            .await
+            if let Ok(Ok(addrs)) =
+                tokio::time::timeout(Duration::from_millis(1500), tokio::net::lookup_host(host))
+                    .await
             {
                 let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
                 let p = pick_preferred_ip(&ips);
@@ -556,7 +561,7 @@ pub async fn resolve_doh(domain: &str) -> Option<String> {
             (ip.clone(), Instant::now() + Duration::from_secs(300)),
         );
     }
-    
+
     final_ip
 }
 

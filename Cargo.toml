@@ -1,6 +1,6 @@
 [package]
 name = "tgwsproxy"
-version = "1.0.0"
+version = "1.3.0"
 edition = "2021"
 
 [lib]
@@ -20,14 +20,20 @@ ctr = "0.9"
 cipher = "0.4"
 sha2 = "0.10"
 hmac = "0.12"
+subtle = "2"
 base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
 byteorder = "1"
 socket2 = "0.5"
+webpki-roots = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+bytes = "1"
+h2 = "0.4"
+http = "1"
 
 # HTTP-клиент для DoH/GitHub без TLS-дублирования: используем reqwest на rustls
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "http2", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -36,7 +42,7 @@ android_logger = "0.14"
 log = "0.4"
 
 [profile.release]
-opt-level = "z"
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"

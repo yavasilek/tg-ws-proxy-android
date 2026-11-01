@@ -82,7 +82,8 @@ pub static BUFFER_SIZE: AtomicI32 = AtomicI32::new(256 * 1024);
 pub static POOL_SIZE: AtomicI32 = AtomicI32::new(DEFAULT_POOL_SZ);
 pub static LOG_VERBOSE: AtomicBool = AtomicBool::new(false);
 // proxy/config.py::ProxyConfig — мобильные эквиваленты
-pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(true);
+pub static DISABLE_SECURE: AtomicBool = AtomicBool::new(false);
+pub static H2_MEDIA_ENABLED: AtomicBool = AtomicBool::new(true);
 pub static FORCE_TEST_DC: AtomicBool = AtomicBool::new(false);
 pub static PROXY_PROTOCOL: AtomicBool = AtomicBool::new(false);
 
@@ -94,7 +95,10 @@ pub struct Cfproxy429State {
 
 impl Default for Cfproxy429State {
     fn default() -> Self {
-        Cfproxy429State { until: None, strikes: 0 }
+        Cfproxy429State {
+            until: None,
+            strikes: 0,
+        }
     }
 }
 
@@ -118,10 +122,8 @@ pub static CFPROXY: Lazy<RwLock<CfproxyConfig>> = Lazy::new(|| {
 });
 
 // proxy/config.py: cfproxy_worker_domains + fake_tls_domain
-pub static CF_WORKER_DOMAINS: Lazy<RwLock<Vec<String>>> =
-    Lazy::new(|| RwLock::new(Vec::new()));
-pub static FAKE_TLS_DOMAIN: Lazy<RwLock<String>> =
-    Lazy::new(|| RwLock::new(String::new()));
+pub static CF_WORKER_DOMAINS: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(Vec::new()));
+pub static FAKE_TLS_DOMAIN: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::new()));
 
 pub static CFPROXY_429: Lazy<RwLock<HashMap<String, Cfproxy429State>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -310,6 +312,7 @@ pub fn is_reserved_start(s: &[u8]) -> bool {
     s4 == b"HEAD"
         || s4 == b"POST"
         || s4 == b"GET "
+        || s4 == b"OPTI"
         || s4 == [0xee, 0xee, 0xee, 0xee]
         || s4 == [0xdd, 0xdd, 0xdd, 0xdd]
         || s4 == [0x16, 0x03, 0x01, 0x02]
@@ -324,6 +327,10 @@ pub struct Stats {
     pub connections_total: AtomicI64,
     pub connections_active: AtomicI64,
     pub connections_ws: AtomicI64,
+    pub connections_h2: AtomicI64,
+    pub h2_tcp_connections: AtomicI64,
+    pub h2_requests: AtomicI64,
+    pub h2_errors: AtomicI64,
     pub connections_tcp_fallback: AtomicI64,
     pub connections_cfproxy: AtomicI64,
     pub connections_fronting: AtomicI64,
@@ -361,10 +368,14 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            "total={} active={} ws={} h2={} h2_tcp={} h2_req={} h2_err={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
+            self.connections_h2.load(Ordering::Relaxed),
+            self.h2_tcp_connections.load(Ordering::Relaxed),
+            self.h2_requests.load(Ordering::Relaxed),
+            self.h2_errors.load(Ordering::Relaxed),
             self.connections_tcp_fallback.load(Ordering::Relaxed),
             self.connections_cfproxy.load(Ordering::Relaxed),
             self.connections_fronting.load(Ordering::Relaxed),
@@ -379,7 +390,10 @@ impl Stats {
     }
 
     pub fn summary_ru(&self) -> String {
-        let mut parts = vec![format!("акт:{}", self.connections_active.load(Ordering::Relaxed))];
+        let mut parts = vec![format!(
+            "акт:{}",
+            self.connections_active.load(Ordering::Relaxed)
+        )];
         let ws = self.connections_ws.load(Ordering::Relaxed);
         if ws > 0 {
             parts.push(format!("ws:{}", ws));
@@ -408,6 +422,10 @@ impl Stats {
         self.connections_total.store(0, Ordering::Relaxed);
         self.connections_active.store(0, Ordering::Relaxed);
         self.connections_ws.store(0, Ordering::Relaxed);
+        self.connections_h2.store(0, Ordering::Relaxed);
+        self.h2_tcp_connections.store(0, Ordering::Relaxed);
+        self.h2_requests.store(0, Ordering::Relaxed);
+        self.h2_errors.store(0, Ordering::Relaxed);
         self.connections_tcp_fallback.store(0, Ordering::Relaxed);
         self.connections_cfproxy.store(0, Ordering::Relaxed);
         self.connections_fronting.store(0, Ordering::Relaxed);
@@ -448,9 +466,11 @@ fn android_log_line(line: &str) {
         fn __android_log_print(prio: i32, tag: *const i8, fmt: *const i8, ...) -> i32;
     }
     const ANDROID_LOG_INFO: i32 = 4;
-    if let (Ok(tag), Ok(fmt), Ok(msg)) =
-        (CString::new("TgWsProxy"), CString::new("%s"), CString::new(line))
-    {
+    if let (Ok(tag), Ok(fmt), Ok(msg)) = (
+        CString::new("TgWsProxy"),
+        CString::new("%s"),
+        CString::new(line),
+    ) {
         unsafe {
             __android_log_print(
                 ANDROID_LOG_INFO,
@@ -514,9 +534,7 @@ fn is_likely_domain(token: &str) -> bool {
         return false;
     }
     parts.iter().all(|p| {
-        !p.is_empty()
-            && p.len() <= 63
-            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        !p.is_empty() && p.len() <= 63 && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     })
 }
 

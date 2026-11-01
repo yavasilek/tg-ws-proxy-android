@@ -2,51 +2,31 @@ use crate::config::ZERO64;
 use aes::cipher::{KeyIvInit, StreamCipher};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
-type Aes256Ctr = ctr::Ctr64BE<aes::Aes256>;
+type Aes256Ctr = ctr::Ctr128BE<aes::Aes256>;
 
 // ---------------------------------------------------------------------------
 // TrackedStream — эмулирует Go cipher.Stream с поддержкой Clone() через
-// "промотку" keystream на processed байт.
+// копирование внутреннего состояния AES/CTR за O(1).
 // ---------------------------------------------------------------------------
 
 pub struct TrackedStream {
-    key: Vec<u8>,
-    iv: Vec<u8>,
-    processed: u64,
     stream: Aes256Ctr,
 }
 
 impl TrackedStream {
     pub fn new(key: &[u8], iv: &[u8]) -> TrackedStream {
         let stream = Aes256Ctr::new(key.into(), iv.into());
-        TrackedStream {
-            key: key.to_vec(),
-            iv: iv.to_vec(),
-            processed: 0,
-            stream,
-        }
+        TrackedStream { stream }
     }
 
     // XOR in place (dst == src в нашем использовании)
     pub fn xor(&mut self, data: &mut [u8]) {
         self.stream.apply_keystream(data);
-        self.processed += data.len() as u64;
     }
 
     pub fn clone_state(&self) -> TrackedStream {
-        let mut clone_stream = Aes256Ctr::new(self.key.as_slice().into(), self.iv.as_slice().into());
-        let mut dummy = [0u8; 16384];
-        let mut rem = self.processed;
-        while rem > 0 {
-            let n = if rem > 16384 { 16384 } else { rem as usize };
-            clone_stream.apply_keystream(&mut dummy[..n]);
-            rem -= n as u64;
-        }
         TrackedStream {
-            key: self.key.clone(),
-            iv: self.iv.clone(),
-            processed: self.processed,
-            stream: clone_stream,
+            stream: self.stream.clone(),
         }
     }
 }
@@ -110,6 +90,26 @@ impl MsgSplitter {
         self.stream.apply_keystream(&mut decrypted);
         self.plain_buf.extend_from_slice(&decrypted);
 
+        self.drain_packets()
+    }
+
+    /// Fast bridge path: the client plaintext is already available, so no third AES pass.
+    pub fn split_plaintext(
+        &mut self,
+        chunk: &mut [u8],
+        encryptor: &mut TrackedStream,
+    ) -> Vec<Vec<u8>> {
+        if self.disabled {
+            encryptor.xor(chunk);
+            return vec![chunk.to_vec()];
+        }
+        self.plain_buf.extend_from_slice(chunk);
+        encryptor.xor(chunk);
+        self.cipher_buf.extend_from_slice(chunk);
+        self.drain_packets()
+    }
+
+    fn drain_packets(&mut self) -> Vec<Vec<u8>> {
         // Порт MsgSplitter.split из proxy/bridge.py: идём по буферу с offset,
         // а не удаляем каждый пакет с начала (иначе O(N^2) на чанке с кучей
         // мелких пакетов). Один trailing del в конце — O(N).
@@ -296,4 +296,42 @@ pub fn write_be_u16(buf: &mut [u8], v: u16) {
 #[allow(dead_code)]
 pub fn write_be_u64(buf: &mut [u8], v: u64) {
     BigEndian::write_u64(buf, v);
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn aes256_ctr_nist_vector_and_partial_clone() {
+        let key = hex::decode("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+            .unwrap();
+        let iv = hex::decode("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff").unwrap();
+        let mut data =
+            hex::decode("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+                .unwrap();
+        let mut stream = new_aes_ctr(&key, &iv);
+        stream.xor(&mut data[..7]);
+        let mut cloned = stream.clone_state();
+        let mut tail = data[7..].to_vec();
+        cloned.xor(&mut tail);
+        stream.xor(&mut data[7..]);
+        assert_eq!(data[7..], tail);
+        assert_eq!(
+            hex::encode(data),
+            "601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5"
+        );
+    }
+    #[test]
+    fn ctr_carries_across_low_64_bits() {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        let key = [0u8; 32];
+        let iv = [255u8; 16];
+        let mut stream = new_aes_ctr(&key, &iv);
+        let mut data = [0u8; 32];
+        stream.xor(&mut data);
+        let aes = aes::Aes256::new((&key).into());
+        let mut block = [0u8; 16].into();
+        aes.encrypt_block(&mut block);
+        assert_eq!(&data[16..], block.as_slice());
+    }
 }

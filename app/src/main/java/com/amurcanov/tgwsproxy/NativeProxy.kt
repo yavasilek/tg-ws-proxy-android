@@ -17,6 +17,7 @@ interface ProxyLibrary : Library {
     fun SetCfProxyConfig(enabled: Int, priority: Int, userDomain: String)
     fun SetCfWorkerDomains(domains: String)
     fun SetFakeTlsDomain(domain: String)
+    fun SetH2Enabled(v: Int)
     fun SetDisableSecure(v: Int)
     fun SetForceTestDc(v: Int)
     fun SetProxyProtocol(v: Int)
@@ -61,6 +62,8 @@ object NativeProxy {
     fun setFakeTlsDomain(domain: String) {
         ProxyLibrary.INSTANCE.SetFakeTlsDomain(domain)
     }
+
+    fun setH2Enabled(v: Boolean) { ProxyLibrary.INSTANCE.SetH2Enabled(if (v) 1 else 0) }
 
     fun setDisableSecure(v: Boolean) {
         ProxyLibrary.INSTANCE.SetDisableSecure(if (v) 1 else 0)
