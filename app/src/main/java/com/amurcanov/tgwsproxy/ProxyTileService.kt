@@ -6,6 +6,7 @@ import android.graphics.drawable.Icon
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import androidx.annotation.RequiresApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -14,6 +15,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
+@RequiresApi(24)
 class ProxyTileService : TileService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -89,11 +91,14 @@ class ProxyTileService : TileService() {
         }
     }
 
-    companion object {
-        fun requestSync(context: Context) {
-            runCatching {
-                requestListeningState(context, ComponentName(context, ProxyTileService::class.java))
-            }
+}
+
+// Kept separate from TileService so API 21-23 never load its unavailable superclass.
+object ProxyTileSync {
+    fun requestSync(context: Context) {
+        if (Build.VERSION.SDK_INT < 24) return
+        runCatching {
+            TileService.requestListeningState(context, ComponentName(context, ProxyTileService::class.java))
         }
     }
 }

@@ -41,6 +41,7 @@ import com.amurcanov.tgwsproxy.ProxyController
 import com.amurcanov.tgwsproxy.ProxyService
 import com.amurcanov.tgwsproxy.SettingsStore
 import com.amurcanov.tgwsproxy.R
+import com.amurcanov.tgwsproxy.connectionStatusResource
 import kotlinx.coroutines.launch
 
 @Composable
@@ -48,6 +49,7 @@ fun ConnectionTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val isRunning by ProxyService.isRunning.collectAsStateWithLifecycle()
     val isVerifiedRunning by ProxyService.isVerifiedRunning.collectAsStateWithLifecycle()
+    val connectionState by ProxyService.connectionState.collectAsStateWithLifecycle()
 
     val isReady by settingsStore.isReady.collectAsStateWithLifecycle(initialValue = false)
 
@@ -85,9 +87,8 @@ fun ConnectionTab(settingsStore: SettingsStore) {
 
     var isStarting by remember { mutableStateOf(false) }
     val statusText = when {
-        isVerifiedRunning -> stringResource(R.string.status_connected)
-        isStarting || isRunning -> stringResource(R.string.status_connecting)
-        else -> stringResource(R.string.status_disconnected)
+        isStarting && !isRunning -> stringResource(R.string.status_connecting)
+        else -> stringResource(connectionStatusResource(connectionState))
     }
 
     LaunchedEffect(isRunning, isVerifiedRunning) {

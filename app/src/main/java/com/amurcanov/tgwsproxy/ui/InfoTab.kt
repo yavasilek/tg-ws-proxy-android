@@ -244,7 +244,7 @@ fun InfoTab(settingsStore: SettingsStore) {
                     subtitle = stringResource(R.string.report_subtitle),
                     modifier = Modifier.weight(1f),
                     onClick = {
-                        val clipboard = context.getSystemService(ClipboardManager::class.java)
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                         clipboard?.setPrimaryClip(ClipData.newPlainText("TgWsProxy Report", reportText))
                         Toast.makeText(context, context.getString(R.string.report_copied), Toast.LENGTH_SHORT).show()
                     },

@@ -140,4 +140,15 @@
     <string name="engine_test_dc">Тестовые датацентры Telegram</string>
     <string name="engine_proxy_protocol">Требовать PROXY protocol v1</string>
     <string name="engine_buffer_kb">Буфер сокета, КБ</string>
+    <string name="engine_domain_error">Введите домен без https://, порта и пути. Пример: example.com</string>
+    <string name="engine_buffer_help">Целое число от 4 до 4096 КБ. По умолчанию: 256 КБ.</string>
+    <string name="engine_test_dc_help">Тестовые датацентры нужны для тестовых аккаунтов, а не обычного аккаунта Telegram.</string>
+    <string name="engine_proxy_protocol_help">Включайте только за обратным прокси, передающим заголовок PROXY v1. Прямое подключение Telegram с этой опцией не работает.</string>
+    <string name="engine_reset">Сбросить сетевые настройки</string>
+    <string name="engine_reset_help">Восстановить настройки сетевого движка? Домены Worker и Fake TLS будут очищены. Если использовался Fake TLS, заново примените прокси в Telegram. Базовый ключ, порт и остальные настройки сохранятся.</string>
+    <string name="status_no_network">Нет сети</string>
+    <string name="status_reconnecting">Переподключение</string>
+    <string name="status_network_unverified">Прокси работает - интернет не проверен</string>
+    <string name="status_proxy_ready">Прокси работает</string>
+    <string name="status_service_error">Не удалось запустить прокси</string>
 </resources>

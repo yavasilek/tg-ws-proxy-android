@@ -59,4 +59,13 @@ class NativeEngineTest {
         assertFalse(value.copy(fakeTls = "https://example.com").isValid())
         assertFalse(value.copy(bufferKb = 0).isValid())
     }
+
+    @Test fun exportsExactTrafficCountersForPowerPolicy() {
+        configure()
+        val port = ServerSocket(0).use { it.localPort }
+        assertEquals(0, NativeProxy.startProxy("127.0.0.1", port, "", secret, 0))
+        val stats = NativeProxy.getStats().orEmpty()
+        assertTrue(stats.contains("up_bytes=0"))
+        assertTrue(stats.contains("down_bytes=0"))
+    }
 }

@@ -20,7 +20,7 @@ object ProxyController {
             if (showInvalidPortToast) {
                 Toast.makeText(context, context.getString(R.string.invalid_port), Toast.LENGTH_SHORT).show()
             }
-            ProxyTileService.requestSync(context)
+            ProxyTileSync.requestSync(context)
             return false
         }
 
@@ -76,7 +76,7 @@ object ProxyController {
                 putExtra(ProxyService.EXTRA_SECRET_KEY, secretKey)
             }
         )
-        ProxyTileService.requestSync(context)
+        ProxyTileSync.requestSync(context)
         return true
     }
 
@@ -86,7 +86,7 @@ object ProxyController {
                 action = ProxyService.ACTION_STOP
             }
         )
-        ProxyTileService.requestSync(context)
+        ProxyTileSync.requestSync(context)
     }
 
     private suspend fun ensureSecretKey(settingsStore: SettingsStore): String {

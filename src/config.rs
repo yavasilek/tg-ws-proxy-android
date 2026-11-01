@@ -368,7 +368,7 @@ impl Stats {
             "n/a".to_string()
         };
         format!(
-            "total={} active={} ws={} h2={} h2_tcp={} h2_req={} h2_err={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={}",
+            "total={} active={} ws={} h2={} h2_tcp={} h2_req={} h2_err={} tcp_fb={} cf={} front={} bad={} masked={} err={} pool={} cf_pool={} up={} down={} up_bytes={} down_bytes={}",
             self.connections_total.load(Ordering::Relaxed),
             self.connections_active.load(Ordering::Relaxed),
             self.connections_ws.load(Ordering::Relaxed),
@@ -386,6 +386,8 @@ impl Stats {
             cf_pool_s,
             human_bytes(self.bytes_up.load(Ordering::Relaxed)),
             human_bytes(self.bytes_down.load(Ordering::Relaxed)),
+            self.bytes_up.load(Ordering::Relaxed),
+            self.bytes_down.load(Ordering::Relaxed),
         )
     }
 

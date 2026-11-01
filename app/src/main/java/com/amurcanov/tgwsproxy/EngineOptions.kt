@@ -17,18 +17,20 @@ data class EngineOptions(
         put("proxyProtocol", proxyProtocol); put("bufferKb", bufferKb)
     }.toString()
 
-    fun isValid(): Boolean {
-        fun domain(value: String): Boolean = value.length in 4..253 && value.split('.').let { labels ->
+    fun invalidWorkers(): Boolean = workers.split(Regex("[,;\\s]+"))
+        .filter { it.isNotBlank() }.any { !isDomain(it) }
+
+    fun invalidFakeTls(): Boolean = fakeTls.isNotBlank() && !isDomain(fakeTls.trim())
+
+    fun isValid(): Boolean = bufferKb in 4..4096 && !invalidWorkers() && !invalidFakeTls()
+
+    companion object {
+        private fun isDomain(value: String): Boolean = value.length in 4..253 && value.split('.').let { labels ->
             labels.size >= 2 && labels.all { label ->
                 label.length in 1..63 && label.first() != '-' && label.last() != '-' &&
                     label.all { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it == '-' }
             } && labels.last().length >= 2 && labels.last().any { it in 'a'..'z' || it in 'A'..'Z' }
         }
-        return bufferKb in 4..4096 && (fakeTls.isBlank() || domain(fakeTls.trim())) &&
-            workers.split(Regex("[,;\\s]+")).filter { it.isNotBlank() }.all(::domain)
-    }
-
-    companion object {
         fun fromJson(raw: String): EngineOptions = runCatching {
             val json = JSONObject(raw)
             EngineOptions(json.optBoolean("h2", true), json.optBoolean("noSecure", false),

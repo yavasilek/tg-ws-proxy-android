@@ -10,16 +10,19 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
-import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlin.time.Duration.Companion.milliseconds
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+
+enum class ConnectionState { STOPPED, STARTING, NO_NETWORK, RECONNECTING, READY, UNVERIFIED, ERROR }
 
 class ProxyService : Service() {
 
@@ -31,7 +34,16 @@ class ProxyService : Service() {
     private var notificationStartedAtMs: Long = 0L
     @Volatile
     private var stopInProgress = false
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val serviceScope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
+    private var requested = false
+    private var generation = 0
+    private var engineReady = false
+    private var recoveryPending = false
+    private var restartAgain = false
+    private var networkJob: Job? = null
+    private var monitor: NetworkMonitor? = null
+    private var network = NetworkSnapshot(null, false, false)
+    private var hasNetworkSnapshot = false
 
     // Saved intent extras for restart on kill / onTaskRemoved
     private var lastBindIp: String = "127.0.0.1"
@@ -45,6 +57,7 @@ class ProxyService : Service() {
     private var lastEngineOptions: String = "{}"
 
     companion object {
+        private val lifecycleMutex = Mutex()
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
         const val ACTION_STOP = "com.amurcanov.tgwsproxy.STOP"
         const val ACTION_RESTART = "com.amurcanov.tgwsproxy.RESTART"
@@ -62,27 +75,30 @@ class ProxyService : Service() {
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
         private const val TAG = "ProxyService"
 
-        // Wakelock refresh interval (25 min, re-acquire before 30-min timeout)
-        private const val WAKELOCK_TIMEOUT_MS = 30L * 60 * 1000
-        private const val WAKELOCK_REFRESH_MS = 25L * 60 * 1000
+        // Bounded leases, renewed only while a client is active. Idle never holds the CPU.
+        private const val WAKELOCK_TIMEOUT_MS = 30_000L
 
         // Stats/notification update interval
         private const val STATS_UPDATE_MS = 3_000L
         private const val NOTIFICATION_MIN_UPDATE_MS = 3_000L
-        private const val NATIVE_STOP_WAIT_MS = 3_000L
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning
         private val _isVerifiedRunning = MutableStateFlow(false)
         val isVerifiedRunning: StateFlow<Boolean> = _isVerifiedRunning
+        private val _connectionState = MutableStateFlow(ConnectionState.STOPPED)
+        val connectionState: StateFlow<ConnectionState> = _connectionState
     }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        monitor = NetworkMonitor(this, ::onNetworkChanged).also { it.start() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Even a redundant start racing a stop must acknowledge startForegroundService.
+        if (intent?.action == ACTION_START) promoteToForeground()
         when (intent?.action) {
             ACTION_START -> {
                 LogManager.clearLogs()
@@ -101,7 +117,8 @@ class ProxyService : Service() {
                 stopProxy()
             }
             ACTION_RESTART -> {
-                restartProxy()
+                if (requested) restartProxy()
+                else serviceScope.launch { ProxyController.startFromSavedSettings(this@ProxyService) }
             }
             null -> {
                 // Service restarted by system after being killed (START_REDELIVER_INTENT)
@@ -136,8 +153,13 @@ class ProxyService : Service() {
     private fun startProxy(bindIp: String, port: Int, ips: String, poolSize: Int = 4,
                            cfEnabled: Boolean = true, cfPriority: Boolean = true,
                            cfDomain: String = "", secretKey: String = "", engineOptions: String = "{}") {
-        if (_isRunning.value || stopInProgress) return
+        if (requested || stopInProgress) return
+        requested = true
+        generation++
+        engineReady = false
+        updateRunningState(true)
         _isVerifiedRunning.value = false
+        _connectionState.value = ConnectionState.STARTING
 
         // Save params for restart
         lastBindIp = bindIp
@@ -153,7 +175,19 @@ class ProxyService : Service() {
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
 
-        val notification = createNotification(lastNotificationContent)
+        promoteToForeground()
+
+        stopInProgress = false
+        val token = generation
+        serviceScope.launch {
+            lifecycleMutex.withLock {
+                if (requested && generation == token) startEngine(token)
+            }
+        }
+    }
+
+    private fun promoteToForeground() {
+        val notification = createNotification(lastNotificationContent.ifEmpty { getString(R.string.notification_starting) })
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
                 NOTIFICATION_ID,
@@ -164,25 +198,16 @@ class ProxyService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        acquireWakeLock()
-        stopInProgress = false
-        
-        // Start Rust proxy in a separate thread with error handling
-        Thread({
-            val canObtainPort = isPortAvailable(bindIp, port)
-            if (!canObtainPort) {
-                val str = getString(R.string.port_is_not_available, port)
-                serviceScope.launch(Dispatchers.Main) {
-                    Toast.makeText(this@ProxyService, str, Toast.LENGTH_SHORT).show()
-                    updateNotification(str, force = true)
-                    stopProxy()
-                }
-                return@Thread
-            }
+    }
 
-            try {
-                val options = EngineOptions.fromJson(engineOptions)
-                check(options.isValid()) { "Invalid network settings" }
+    // All native start/stop calls are serialized. Late completions cannot undo a user stop.
+    private suspend fun startEngine(token: Int) {
+        acquireWakeLock()
+        val result = try {
+            withContext(Dispatchers.IO) {
+                check(isPortAvailable(lastBindIp, lastPort)) { getString(R.string.port_is_not_available, lastPort) }
+                val options = EngineOptions.fromJson(lastEngineOptions)
+                check(options.isValid()) { getString(R.string.invalid_network_settings) }
                 NativeProxy.setH2Enabled(options.h2)
                 NativeProxy.setDisableSecure(options.noSecure)
                 NativeProxy.setCfWorkerDomains(options.workers)
@@ -190,71 +215,94 @@ class ProxyService : Service() {
                 NativeProxy.setForceTestDc(options.testDc)
                 NativeProxy.setProxyProtocol(options.proxyProtocol)
                 NativeProxy.setBufferSizeKb(options.bufferKb)
-                NativeProxy.setPoolSize(poolSize)
+                NativeProxy.setPoolSize(lastPoolSize)
                 NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
-                NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
-                val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
-                if (result == 0) {
-                    serviceScope.launch {
-                        if (!stopInProgress) {
-                            updateRunningState(true)
-                            _isVerifiedRunning.value = true
-                            updateNotification(getString(R.string.notification_running), force = true)
-                            Log.i(TAG, "Proxy ready: listening on port $port")
+                NativeProxy.setCfProxyConfig(lastCfEnabled, lastCfPriority, lastCfDomain)
+                NativeProxy.startProxy(lastBindIp, lastPort, lastIps, lastSecretKey, 1)
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            Log.e(TAG, "Proxy start failed", e)
+            -1
+        } catch (e: LinkageError) {
+            Log.e(TAG, "Native library could not be loaded", e)
+            -1
+        }
+        releaseWakeLock()
+        if (!requested || token != generation) return
+        if (result != 0) {
+            _connectionState.value = ConnectionState.ERROR
+            updateNotification(getString(R.string.status_service_error), force = true)
+            stopProxy(error = true)
+            return
+        }
+        engineReady = true
+        recoveryPending = networkJob?.isActive == true && recoveryPending
+        Log.i(TAG, "Proxy ready: listening on port $lastPort")
+        publishConnectionState()
+        statsJob?.cancel()
+        statsJob = serviceScope.launch {
+            var active = 0
+            var holdCpu = false
+            val lease = TrafficWakeLease()
+            while (isActive && requested && token == generation) {
+                try {
+                    if (engineReady) {
+                        val raw = withContext(Dispatchers.IO) { NativeProxy.getStats() }
+                        if (raw != null && token == generation && requested) {
+                            active = extractStat(raw, "active=").toIntOrNull() ?: 0
+                            holdCpu = lease.update(SystemClock.elapsedRealtime(), network.available, active,
+                                extractStat(raw, "up_bytes=").toLongOrNull() ?: 0L,
+                                extractStat(raw, "down_bytes=").toLongOrNull() ?: 0L)
+                            if (holdCpu) acquireWakeLock() else releaseWakeLock()
+                            val total = parseHumanBytes(extractStat(raw, "up=")) + parseHumanBytes(extractStat(raw, "down="))
+                            val prefix = getString(connectionStatusResource(_connectionState.value))
+                            updateNotification(prefix + " - " + getString(R.string.notification_traffic, formatBytes(total), active))
                         }
                     }
-                } else {
-                    Log.e(TAG, "StartProxy returned error code: $result")
-                    serviceScope.launch {
-                        updateNotification(getString(R.string.notification_start_error_code, result), force = true)
-                        delay(3000.milliseconds)
-                        stopProxy()
-                    }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    releaseWakeLock()
+                    Log.w(TAG, "Stats update failed", e)
                 }
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to start proxy via JNA", e)
-                serviceScope.launch {
-                    updateNotification(getString(R.string.notification_error, e.message ?: ""), force = true)
-                    delay(3000.milliseconds)
-                    stopProxy()
-                }
-            }
-        }, "ProxyStart").apply {
-            isDaemon = true
-            start()
-        }
-
-                    // Don't stop — it might start slightly later; let the user decide
-        // Stats updater. Notification updates are throttled so the system keeps
-        // a stable foreground entry instead of constantly reordering it.
-        statsJob = serviceScope.launch {
-            // WakeLock refresh sub-job: re-acquire before system timeout
-            launch {
-                while (isActive) {
-                    delay(WAKELOCK_REFRESH_MS.milliseconds)
-                    refreshWakeLock()
-                }
-            }
-
-            while (isActive) {
-                delay(STATS_UPDATE_MS.milliseconds)
-                if (_isRunning.value && !stopInProgress) {
-                    try {
-                        val rawStats = NativeProxy.getStats() ?: continue
-                        val upRaw = extractStat(rawStats, "up=")
-                        val downRaw = extractStat(rawStats, "down=")
-                        val activeConns = extractStat(rawStats, "active=")
-                        
-                        val totalBytes = parseHumanBytes(upRaw) + parseHumanBytes(downRaw)
-                        val active = activeConns.toIntOrNull() ?: 0
-                        val text = getString(R.string.notification_traffic, formatBytes(totalBytes), active)
-                        updateNotification(text)
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Stats update failed", e)
-                    }
-                }
+                delay(if (!network.available) 30_000L else if (!holdCpu) 15_000L else STATS_UPDATE_MS)
             }
         }
+    }
+
+    private fun onNetworkChanged(value: NetworkSnapshot) {
+        val recover = hasNetworkSnapshot && value.needsRecoveryAfter(network)
+        hasNetworkSnapshot = true
+        network = value
+        if (!requested || stopInProgress) return
+        if (!value.available) {
+            networkJob?.cancel()
+            releaseWakeLock()
+        }
+        publishConnectionState()
+        if (recover) {
+            recoveryPending = true
+            _isVerifiedRunning.value = false
+            _connectionState.value = ConnectionState.RECONNECTING
+            updateNotification(getString(R.string.status_reconnecting), force = true)
+            networkJob?.cancel()
+            networkJob = serviceScope.launch {
+                delay(1_200L)
+                if (requested && network.available) restartProxy()
+            }
+        }
+    }
+
+    private fun publishConnectionState() {
+        val state = when {
+            !network.available -> ConnectionState.NO_NETWORK
+            !engineReady || recoveryPending -> ConnectionState.RECONNECTING
+            !network.validated -> ConnectionState.UNVERIFIED
+            else -> ConnectionState.READY
+        }
+        _connectionState.value = state
+        _isVerifiedRunning.value = engineReady && network.available && state != ConnectionState.RECONNECTING
+        updateNotification(getString(connectionStatusResource(state)), force = true)
     }
 
     private fun updateNotification(content: String, force: Boolean = false) {
@@ -275,35 +323,34 @@ class ProxyService : Service() {
     }
 
     private fun restartProxy() {
-        if (restartJob?.isActive == true) return
-        if (lastPort <= 0 || lastSecretKey.isEmpty()) {
-            Log.w(TAG, "Restart requested without saved proxy configuration")
-            return
-        }
-
+        if (!requested || stopInProgress) return
+        if (restartJob?.isActive == true) { restartAgain = true; return }
+        recoveryPending = false
+        val token = ++generation
+        engineReady = false
+        _isVerifiedRunning.value = false
+        _connectionState.value = ConnectionState.RECONNECTING
+        updateNotification(getString(R.string.status_reconnecting), force = true)
+        statsJob?.cancel()
+        releaseWakeLock()
         restartJob = serviceScope.launch {
-            Log.i(TAG, "Restarting proxy from notification")
-            updateNotification(getString(R.string.notification_restarting), force = true)
-
-            statsJob?.cancel()
-            statsJob = null
-
-            requestNativeStop("restart")
-            releaseWakeLock()
-            updateRunningState(false)
-            delay(350.milliseconds)
-
-            startProxy(
-                bindIp = lastBindIp,
-                port = lastPort,
-                ips = lastIps,
-                poolSize = lastPoolSize,
-                cfEnabled = lastCfEnabled,
-                cfPriority = lastCfPriority,
-                cfDomain = lastCfDomain,
-                secretKey = lastSecretKey,
-                engineOptions = lastEngineOptions
-            )
+            lifecycleMutex.withLock {
+                if (!requested || token != generation) return@withLock
+                Log.i(TAG, "Rebuilding proxy connections")
+                try {
+                    withContext(Dispatchers.IO) { NativeProxy.stopProxy() }
+                    if (requested && token == generation) startEngine(token)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.e(TAG, "Proxy restart failed", e)
+                    stopProxy(error = true)
+                }
+            }
+            restartJob = null
+            if (restartAgain && requested && network.available) {
+                restartAgain = false
+                restartProxy()
+            }
         }
     }
 
@@ -333,52 +380,28 @@ class ProxyService : Service() {
         return "%.2fGB".format(bytes / (1024 * 1024 * 1024))
     }
 
-    private fun stopProxy() {
+    private fun stopProxy(error: Boolean = false) {
         if (stopInProgress) return
+        requested = false
+        generation++
         stopInProgress = true
-        restartJob?.cancel()
-        restartJob = null
+        engineReady = false
+        networkJob?.cancel()
         statsJob?.cancel()
-        statsJob = null
+        releaseWakeLock()
+        _isVerifiedRunning.value = false
+        _connectionState.value = if (error) ConnectionState.ERROR else ConnectionState.STOPPED
         serviceScope.launch {
-            updateNotification(getString(R.string.notification_stopping), force = true)
-            requestNativeStop("stop")
-            releaseWakeLock()
-            updateRunningState(false)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
+            lifecycleMutex.withLock {
+                try { withContext(Dispatchers.IO) { NativeProxy.stopProxy() } }
+                catch (e: Exception) { Log.w(TAG, "Proxy stop failed", e) }
+                catch (e: LinkageError) { Log.w(TAG, "Native library unavailable", e) }
             }
+            updateRunningState(false)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
+            else { @Suppress("DEPRECATION") stopForeground(true) }
             stopSelf()
         }
-    }
-
-    private suspend fun requestNativeStop(reason: String): Boolean {
-        val completed = CompletableDeferred<Unit>()
-        Thread({
-            try {
-                NativeProxy.stopProxy()
-            } catch (e: Exception) {
-                Log.w(TAG, "StopProxy failed during $reason", e)
-            } finally {
-                completed.complete(Unit)
-            }
-        }, "ProxyStop-$reason").apply {
-            isDaemon = true
-            start()
-        }
-
-        val finished = withTimeoutOrNull(NATIVE_STOP_WAIT_MS.milliseconds) {
-            completed.await()
-            true
-        } ?: false
-
-        if (!finished) {
-            Log.w(TAG, "Native stop is still running after ${NATIVE_STOP_WAIT_MS}ms during $reason")
-        }
-        return finished
     }
 
     /**
@@ -397,39 +420,13 @@ class ProxyService : Service() {
     private fun acquireWakeLock() {
         try {
             val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
+            if (wakeLock == null) wakeLock = powerManager.newWakeLock(
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "TgWsProxy::ServiceWakeLock"
-            ).apply {
-                // Acquire with timeout. System may ignore indefinite wakelocks.
-                acquire(WAKELOCK_TIMEOUT_MS)
-            }
-            Log.d(TAG, "WakeLock acquired (${WAKELOCK_TIMEOUT_MS / 60000}min)")
+            ).apply { setReferenceCounted(false) }
+            wakeLock?.acquire(WAKELOCK_TIMEOUT_MS)
         } catch (e: Exception) {
             Log.w(TAG, "Failed to acquire WakeLock", e)
-        }
-    }
-
-    /**
-     * Periodically refresh wakelock to prevent system from expiring it.
-     */
-    private fun refreshWakeLock() {
-        try {
-            wakeLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                }
-            }
-            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "TgWsProxy::ServiceWakeLock"
-            ).apply {
-                acquire(WAKELOCK_TIMEOUT_MS)
-            }
-            Log.d(TAG, "WakeLock refreshed")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to refresh WakeLock", e)
         }
     }
 
@@ -451,7 +448,7 @@ class ProxyService : Service() {
         if (!isRunning) {
             _isVerifiedRunning.value = false
         }
-        ProxyTileService.requestSync(this)
+        ProxyTileSync.requestSync(this)
     }
 
     private fun createNotificationChannel() {
@@ -515,8 +512,11 @@ class ProxyService : Service() {
     }
 
     override fun onDestroy() {
-        restartJob?.cancel()
-        restartJob = null
+        val needsCleanup = requested
+        requested = false
+        generation++
+        monitor?.stop()
+        networkJob?.cancel()
         statsJob?.cancel()
         statsJob = null
         releaseWakeLock()
@@ -524,10 +524,26 @@ class ProxyService : Service() {
             updateRunningState(false)
         }
         serviceScope.cancel()
+        // Also cover an unexpected Service destruction while a native start was in flight.
+        if (needsCleanup) CoroutineScope(Dispatchers.IO).launch {
+            lifecycleMutex.withLock {
+                runCatching { NativeProxy.stopProxy() }
+            }
+        }
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? {
         return null
     }
+}
+
+fun connectionStatusResource(state: ConnectionState): Int = when (state) {
+    ConnectionState.STOPPED -> R.string.status_disconnected
+    ConnectionState.STARTING -> R.string.status_connecting
+    ConnectionState.NO_NETWORK -> R.string.status_no_network
+    ConnectionState.RECONNECTING -> R.string.status_reconnecting
+    ConnectionState.READY -> R.string.status_proxy_ready
+    ConnectionState.UNVERIFIED -> R.string.status_network_unverified
+    ConnectionState.ERROR -> R.string.status_service_error
 }

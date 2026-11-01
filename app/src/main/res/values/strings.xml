@@ -140,4 +140,15 @@
     <string name="engine_test_dc">Use Telegram test datacenters</string>
     <string name="engine_proxy_protocol">Require PROXY protocol v1</string>
     <string name="engine_buffer_kb">Socket buffer, KB</string>
+    <string name="engine_domain_error">Enter a domain without https://, a port or a path. Example: example.com</string>
+    <string name="engine_buffer_help">Whole number from 4 to 4096 KB. Default: 256 KB.</string>
+    <string name="engine_test_dc_help">Test datacenters are for test accounts, not your regular Telegram account.</string>
+    <string name="engine_proxy_protocol_help">Enable only behind a reverse proxy sending PROXY v1 headers. A direct Telegram connection will not work with this option.</string>
+    <string name="engine_reset">Reset network settings</string>
+    <string name="engine_reset_help">Restore the network engine defaults? Worker and Fake TLS domains will be cleared. Reapply the proxy in Telegram if Fake TLS was used. The base secret, port and other app settings are kept.</string>
+    <string name="status_no_network">No network</string>
+    <string name="status_reconnecting">Reconnecting</string>
+    <string name="status_network_unverified">Proxy running - internet not verified</string>
+    <string name="status_proxy_ready">Proxy running</string>
+    <string name="status_service_error">Could not start proxy</string>
 </resources>
