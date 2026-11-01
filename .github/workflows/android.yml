@@ -26,6 +26,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      - uses: android-actions/setup-android@v4.0.4
       - name: Install Android native targets
         run: |
           rustup target add aarch64-linux-android armv7-linux-androideabi
@@ -33,7 +34,7 @@ jobs:
       - name: Build native libraries from source
         shell: bash
         run: |
-          NDK_BIN="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          NDK_BIN="$ANDROID_SDK_ROOT/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang"
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
