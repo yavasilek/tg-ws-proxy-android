@@ -49,6 +49,7 @@ fun AppSectionCard(
     Surface(
         shape = RoundedCornerShape(28.dp),
         color = appSectionCardColor(),
+        contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(1.dp, appSectionCardBorderColor()),
         shadowElevation = 10.dp,
         tonalElevation = 2.dp,

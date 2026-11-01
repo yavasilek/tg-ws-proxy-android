@@ -1,6 +1,7 @@
 package com.amurcanov.tgwsproxy.ui
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -8,6 +9,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -28,10 +31,16 @@ fun EngineSettingsSection(store: SettingsStore, running: Boolean, cfEnabled: Boo
         scope.launch { store.saveEngineOptions(value) }
     }
     AppSectionCard {
-        Text(stringResource(R.string.engine_options_title, BuildConfig.UPSTREAM_VERSION), style = MaterialTheme.typography.titleSmall)
+        Text(
+            stringResource(R.string.engine_options_title, BuildConfig.UPSTREAM_VERSION),
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.primary
+        )
         EngineSwitch(stringResource(R.string.engine_h2), options.h2, !running && cfEnabled && !options.noSecure && !options.testDc) { save(options.copy(h2 = it)) }
         if (!cfEnabled || options.noSecure || options.testDc) {
-            Text(stringResource(R.string.engine_h2_unavailable), style = MaterialTheme.typography.bodySmall)
+            Text(stringResource(R.string.engine_h2_unavailable), style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         EngineSwitch(stringResource(R.string.engine_no_secure), options.noSecure, !running) { save(options.copy(noSecure = it)) }
         OutlinedTextField(value = options.workers, onValueChange = { save(options.copy(workers = it)) },
@@ -55,8 +64,15 @@ fun EngineSettingsSection(store: SettingsStore, running: Boolean, cfEnabled: Boo
 
 @Composable
 private fun EngineSwitch(label: String, checked: Boolean, enabled: Boolean, change: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f).padding(end = 12.dp), style = MaterialTheme.typography.bodyMedium)
-        Switch(checked = checked, onCheckedChange = change, enabled = enabled)
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 48.dp)
+            .toggleable(value = checked, enabled = enabled, role = Role.Switch, onValueChange = change),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, Modifier.weight(1f).padding(end = 12.dp),
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface)
+        Switch(checked = checked, onCheckedChange = null, enabled = enabled)
     }
 }
