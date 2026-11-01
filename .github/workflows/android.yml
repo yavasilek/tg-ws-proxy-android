@@ -1,4 +1,4 @@
-name: Native tests and Android APKs
+name: Native tests and universal Android APK
 on:
   push:
     branches: [main, sync-flowseal-rust]
@@ -46,9 +46,9 @@ jobs:
           mkdir -p app/src/main/jniLibs/{arm64-v8a,armeabi-v7a}
           cp target/aarch64-linux-android/release/libtgwsproxy.so app/src/main/jniLibs/arm64-v8a/
           cp target/armv7-linux-androideabi/release/libtgwsproxy.so app/src/main/jniLibs/armeabi-v7a/
-      - name: Build debug APKs
-        run: bash gradlew :app:assembleArm64Debug :app:assembleArm32Debug :app:assembleUniversalDebug --no-daemon --console=plain
+      - name: Build universal debug APK
+        run: bash gradlew :app:assembleUniversalDebug --no-daemon --console=plain
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: tg-ws-proxy-android-debug
-          path: app/build/outputs/apk/**/debug/*.apk
+          path: app/build/outputs/apk/universal/debug/*.apk
