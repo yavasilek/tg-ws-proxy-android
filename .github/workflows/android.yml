@@ -1,15 +1,41 @@
 name: Native tests and universal Android APK
 on:
   push:
-    branches: [main, sync-flowseal-rust]
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "*.md"
+      - "docs/**/*.md"
+      - ".github/*.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE/**"
+      - ".work.bvc"
+      - ".work.bvc/**"
+      - ".workgraph/**"
   pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "*.md"
+      - "docs/**/*.md"
+      - ".github/*.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/PULL_REQUEST_TEMPLATE/**"
+      - ".work.bvc"
+      - ".work.bvc/**"
+      - ".workgraph/**"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   native:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -18,6 +44,7 @@ jobs:
       - run: python3 tests/smoke_native.py target/debug/libtgwsproxy.so
 
   android:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     needs: native
     steps:

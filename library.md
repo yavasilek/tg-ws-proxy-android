@@ -1,0 +1,1 @@
+- IF changing GitHub Actions triggers, draft PR checks or full pre-publication verification -> read [[.github/CI.md]]
