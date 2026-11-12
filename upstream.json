@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/Flowseal/tg-ws-proxy",
-  "version": "1.11.3",
-  "commit": "50d539c718f1689c0437b7cf623e5995018c01e3",
+  "version": "1.11.4",
+  "commit": "6690b788432fd0f59b0f38e228494bcd6bede1ca",
   "android_base": "540e588d15fbdf806f694fbe0b952ff044d39a07",
   "implementation": "native-rust"
 }

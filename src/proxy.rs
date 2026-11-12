@@ -582,18 +582,54 @@ pub struct CfWorkerEntry {
 
 pub struct CfWorkerPool {
     idle: Mutex<HashMap<i32, VecDeque<CfWorkerEntry>>>,
-    refilling: Mutex<HashSet<i32>>,
+    refilling: Mutex<HashMap<i32, tokio::task::JoinHandle<()>>>,
+    rotating: Mutex<HashMap<i32, tokio::task::JoinHandle<()>>>,
+    refill_failures: Mutex<HashMap<i32, CfRefillBackoff>>,
     exhausted_until: Mutex<HashMap<String, f64>>,
     cancel_token: CancellationToken,
+    timing: CfWorkerTiming,
+    #[cfg(test)]
+    connector: Option<CfTestConnector>,
+}
+
+#[cfg(test)]
+type CfTestConnector = Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(RawWebSocket, String)>> + Send>> + Send + Sync>;
+
+struct CfWorkerTiming {
+    max_age: f64,
+    check_interval: Duration,
+    backoff_initial: f64,
+    backoff_max: f64,
+}
+
+#[derive(Default)]
+struct CfRefillBackoff { failures: u32, retry_at: f64 }
+impl CfRefillBackoff {
+    fn failed(&mut self, now: f64, initial: f64, max: f64) -> f64 {
+        self.failures = self.failures.saturating_add(1);
+        let delay = (initial * 2u32.pow((self.failures - 1).min(12)) as f64).min(max);
+        self.retry_at = now + delay;
+        delay
+    }
 }
 
 impl CfWorkerPool {
     pub fn new(cancel_token: CancellationToken) -> CfWorkerPool {
         CfWorkerPool {
             idle: Mutex::new(HashMap::new()),
-            refilling: Mutex::new(HashSet::new()),
+            refilling: Mutex::new(HashMap::new()),
+            rotating: Mutex::new(HashMap::new()),
+            refill_failures: Mutex::new(HashMap::new()),
             exhausted_until: Mutex::new(HashMap::new()),
             cancel_token,
+            timing: CfWorkerTiming {
+                max_age: CF_WORKER_POOL_MAX_AGE,
+                check_interval: Duration::from_secs(5),
+                backoff_initial: 1.0,
+                backoff_max: 3600.0,
+            },
+            #[cfg(test)]
+            connector: None,
         }
     }
 
@@ -603,13 +639,15 @@ impl CfWorkerPool {
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) -> Option<(RawWebSocket, String)> {
+        if POOL_SIZE.load(Ordering::Relaxed) <= 0 || worker_domains.is_empty()
+            || self.cancel_token.is_cancelled() { return None; }
         let now = now_monotonic();
         let entry = {
             let mut map = self.idle.lock().await;
             let bucket = map.entry(dc).or_insert_with(VecDeque::new);
             let mut hit = None;
             while let Some(e) = bucket.pop_front() {
-                if now - e.created > CF_WORKER_POOL_MAX_AGE || e.ws.is_closed() {
+                if now - e.created >= self.timing.max_age || e.ws.transport_stale().await {
                     let ws = e.ws;
                     tokio::spawn(async move {
                         ws.close().await;
@@ -635,6 +673,7 @@ impl CfWorkerPool {
             }
             None => {
                 STATS.cf_pool_misses.fetch_add(1, Ordering::Relaxed);
+                self.schedule_refill(dc, fallback_dst, worker_domains).await;
                 None
             }
         }
@@ -655,53 +694,85 @@ impl CfWorkerPool {
         fallback_dst: String,
         worker_domains: Vec<String>,
     ) {
-        let should = {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                false
-            } else {
-                r.insert(dc);
-                true
-            }
-        };
-        if !should {
-            return;
+        if POOL_SIZE.load(Ordering::Relaxed) <= 0 || worker_domains.is_empty()
+            || self.cancel_token.is_cancelled() { return; }
+        {
+            let mut rotating = self.rotating.lock().await;
+            rotating.entry(dc).or_insert_with(|| spawn_cf_rotation(
+                self.clone(), dc, fallback_dst.clone(), worker_domains.clone()
+            ));
         }
-        let pool = self.clone();
-        let cancel = self.cancel_token.clone();
-        tokio::spawn(async move {
-            {
-                let map = pool.idle.lock().await;
-                let cur = map.get(&dc).map(|b| b.len()).unwrap_or(0);
-                if cur
-                    >= CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize)
-                {
-                    pool.refilling.lock().await.remove(&dc);
-                    return;
-                }
-            }
+        if self.refill_failures.lock().await.get(&dc)
+            .is_some_and(|state| now_monotonic() < state.retry_at) { return; }
+        let mut refilling = self.refilling.lock().await;
+        refilling.entry(dc).or_insert_with(|| spawn_cf_refill(
+            self.clone(), dc, fallback_dst, worker_domains
+        ));
+    }
+
+    async fn refill(self: Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
+        let target = CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize);
+        let current = self.idle.lock().await.get(&dc).map_or(0, |bucket| bucket.len());
+        if current < target {
             let connection = tokio::select! {
-                _=cancel.cancelled()=>None,
-                result=pool.connect_one(worker_domains.clone(),fallback_dst.clone(),dc)=>result,
+                biased;
+                _ = self.cancel_token.cancelled() => None,
+                result = self.connect_one(worker_domains, fallback_dst, dc) => result,
             };
             if let Some((ws, domain)) = connection {
-                if cancel.is_cancelled() {
+                if self.cancel_token.is_cancelled() {
                     ws.close().await;
-                    pool.refilling.lock().await.remove(&dc);
-                    return;
-                }
-                let mut map = pool.idle.lock().await;
-                map.entry(dc)
-                    .or_insert_with(VecDeque::new)
-                    .push_back(CfWorkerEntry {
-                        ws,
-                        created: now_monotonic(),
-                        worker_domain: domain,
+                } else {
+                    self.idle.lock().await.entry(dc).or_default().push_back(CfWorkerEntry {
+                        ws, created: now_monotonic(), worker_domain: domain,
                     });
-                ldebug!("CF worker pool refilled DC{}: ready", dc);
+                    self.refill_failures.lock().await.remove(&dc);
+                    ldebug!("CF worker pool refilled DC{}: ready", dc);
+                }
+            } else if !self.cancel_token.is_cancelled() {
+                let delay = self.refill_failures.lock().await.entry(dc).or_default()
+                    .failed(now_monotonic(), self.timing.backoff_initial, self.timing.backoff_max);
+                linfo!("CF worker pool refill failed for DC{}, retry in {:.0}s", dc, delay);
             }
-            pool.refilling.lock().await.remove(&dc);
-        });
+        }
+        self.refilling.lock().await.remove(&dc);
+    }
+
+    async fn rotate(self: Arc<Self>, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
+        loop {
+            if self.cancel_token.is_cancelled() || POOL_SIZE.load(Ordering::Relaxed) <= 0 { break; }
+            let now = now_monotonic();
+            let mut sleep = self.timing.check_interval.as_secs_f64();
+            let mut stale = Vec::new();
+            let count = {
+                let mut idle = self.idle.lock().await;
+                let bucket = idle.entry(dc).or_default();
+                let mut ready = VecDeque::new();
+                while let Some(entry) = bucket.pop_front() {
+                    let remaining = entry.created + self.timing.max_age - now;
+                    if remaining <= 0.0 || entry.ws.transport_stale().await {
+                        stale.push(entry.ws);
+                    } else {
+                        sleep = sleep.min(remaining);
+                        ready.push_back(entry);
+                    }
+                }
+                *bucket = ready;
+                bucket.len()
+            };
+            for ws in stale { ws.close().await; }
+            if count < CF_WORKER_PER_DC_LIMIT.min(POOL_SIZE.load(Ordering::Relaxed).max(0) as usize) {
+                self.refill_now(dc, fallback_dst.clone(), worker_domains.clone()).await;
+            }
+            if let Some(state) = self.refill_failures.lock().await.get(&dc) {
+                if state.retry_at > now { sleep = sleep.min(state.retry_at - now); }
+            }
+            tokio::select! {
+                _ = self.cancel_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs_f64(sleep.max(0.001))) => {},
+            }
+        }
+        self.rotating.lock().await.remove(&dc);
     }
 
     async fn connect_one(
@@ -710,6 +781,8 @@ impl CfWorkerPool {
         fallback_dst: String,
         dc: i32,
     ) -> Option<(RawWebSocket, String)> {
+        #[cfg(test)]
+        if let Some(connect) = &self.connector { return connect().await; }
         let secure = !DISABLE_SECURE.load(Ordering::Relaxed);
         let query = format!("dst={}&dc={}", fallback_dst, dc);
         let path = format!("/apiws?{}", query);
@@ -726,6 +799,14 @@ impl CfWorkerPool {
             {
                 Ok(ws) => return Some((ws, worker_domain)),
                 Err(exc) => {
+                    // Do not put Worker domains or destinations in the native log queue.
+                    let kind = match &exc {
+                        WsError::Io(error) => format!("I/O {:?}", error.kind()),
+                        WsError::Timeout => "timeout".to_string(),
+                        WsError::Handshake(error) => format!("HTTP {}", error.status_code),
+                        _ => "transport error".to_string(),
+                    };
+                    ldebug!("CF worker pool connect DC{} failed: {}", dc, kind);
                     self.report_failure(&worker_domain, &exc).await;
                 }
             }
@@ -767,7 +848,7 @@ impl CfWorkerPool {
 
     pub async fn warmup(self: &Arc<Self>, dc_opt_map: &HashMap<i32, String>) {
         let worker_domains = CF_WORKER_DOMAINS.read().clone();
-        if worker_domains.is_empty() {
+        if worker_domains.is_empty() || POOL_SIZE.load(Ordering::Relaxed) <= 0 {
             return;
         }
         // CF worker греем только для DC, которых НЕТ в прямых редиректах.
@@ -790,22 +871,29 @@ impl CfWorkerPool {
     }
 
     pub async fn close_all(&self) {
-        let mut map = self.idle.lock().await;
-        for bucket in map.values_mut() {
-            for e in bucket.drain(..) {
-                tokio::spawn(async move {
-                    e.ws.close().await;
-                });
-            }
-        }
+        self.reset().await;
     }
 
     pub async fn reset(&self) {
-        self.close_all().await;
-        self.idle.lock().await.clear();
-        self.refilling.lock().await.clear();
+        let rotations: Vec<_> = self.rotating.lock().await.drain().map(|(_, task)| task).collect();
+        for task in &rotations { task.abort(); }
+        for task in rotations { let _ = task.await; }
+        let refills: Vec<_> = self.refilling.lock().await.drain().map(|(_, task)| task).collect();
+        for task in &refills { task.abort(); }
+        for task in refills { let _ = task.await; }
+        let entries: Vec<_> = self.idle.lock().await.drain().flat_map(|(_, bucket)| bucket).collect();
+        for entry in entries { entry.ws.close().await; }
+        self.refill_failures.lock().await.clear();
         self.exhausted_until.lock().await.clear();
     }
+}
+
+fn spawn_cf_refill(pool: Arc<CfWorkerPool>, dc: i32, dst: String, domains: Vec<String>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { pool.refill(dc, dst, domains).await; })
+}
+
+fn spawn_cf_rotation(pool: Arc<CfWorkerPool>, dc: i32, dst: String, domains: Vec<String>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { pool.rotate(dc, dst, domains).await; })
 }
 
 // ---------------------------------------------------------------------------
@@ -1613,6 +1701,21 @@ where
 // Client serving — порт tg_ws_proxy._handle_client (dd + ee/FakeTLS).
 // ---------------------------------------------------------------------------
 
+const BAD_HANDSHAKE_DRAIN_LIMIT: usize = 64 * 1024;
+const BAD_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn drain_bad_handshake<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<()> {
+    let mut remaining = BAD_HANDSHAKE_DRAIN_LIMIT;
+    let mut buffer = [0u8; 4096];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len());
+        let read = reader.read(&mut buffer[..want]).await?;
+        if read == 0 { break; }
+        remaining -= read;
+    }
+    Ok(())
+}
+
 async fn read_proxy_protocol_line(conn: &mut TcpStream) -> Option<String> {
     let mut line = Vec::with_capacity(108);
     let mut byte = [0u8; 1];
@@ -1802,6 +1905,7 @@ async fn serve_core<R, W>(
     if !valid_proto(proto) {
         STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
         lwarn!("[{}] bad handshake (wrong secret or proto)", label);
+        let _ = tokio::time::timeout(BAD_HANDSHAKE_DRAIN_TIMEOUT, drain_bad_handshake(&mut conn_read)).await;
         return;
     }
 
@@ -2116,6 +2220,130 @@ pub fn parse_cidr_pool(cidrs_str: &str) -> HashMap<i32, String> {
 #[cfg(test)]
 mod fallback_regression_tests {
     use super::*;
+
+    async fn wait_until(mut ready: impl AsyncFnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready().await { tokio::time::sleep(Duration::from_millis(1)).await; }
+        }).await.unwrap();
+    }
+
+    fn worker_pool(results: Vec<Option<(RawWebSocket, String)>>) -> (CfWorkerPool, Arc<std::sync::atomic::AtomicUsize>) {
+        let mut pool = CfWorkerPool::new(CancellationToken::new());
+        pool.timing.check_interval = Duration::from_millis(5);
+        pool.timing.backoff_initial = 0.03;
+        let results = Arc::new(Mutex::new(VecDeque::from(results)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        pool.connector = Some(Arc::new({
+            let calls = calls.clone();
+            move || {
+                let results = results.clone(); let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    results.lock().await.pop_front().flatten()
+                })
+            }
+        }));
+        (pool, calls)
+    }
+
+    #[test]
+    fn worker_refill_backoff_is_exponential_capped_and_overflow_safe() {
+        let mut state = CfRefillBackoff::default();
+        for (index, expected) in [1., 2., 4., 8., 16., 32., 64., 128., 256., 512., 1024., 2048., 3600., 3600.].into_iter().enumerate() {
+            assert_eq!(state.failed(100., 1., 3600.), expected);
+            assert_eq!(state.retry_at, 100. + expected);
+            assert_eq!(state.failures as usize, index + 1);
+        }
+        state.failures = u32::MAX;
+        assert_eq!(state.failed(100., 1., 3600.), 3600.);
+    }
+
+    #[tokio::test]
+    async fn failed_worker_warmup_recovers_without_client_requests() {
+        let (ready, _peer) = crate::ws::test_socket().await;
+        let (pool, calls) = worker_pool(vec![None, Some((ready, "worker.example".into()))]);
+        let pool = Arc::new(pool);
+        pool.refill_now(2, "192.0.2.2".into(), vec!["worker.example".into()]).await;
+        wait_until(async || pool.idle.lock().await.get(&2).is_some_and(|bucket| !bucket.is_empty())).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(pool.refill_failures.lock().await.is_empty());
+        pool.reset().await;
+        assert!(pool.rotating.lock().await.is_empty());
+        assert!(pool.refilling.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_rotation_replaces_expired_idle_socket_without_clients() {
+        let (stale, mut old_peer) = crate::ws::test_socket().await;
+        let (ready, _new_peer) = crate::ws::test_socket().await;
+        let (mut pool, calls) = worker_pool(vec![Some((ready, "worker.example".into()))]);
+        pool.timing.max_age = 0.05;
+        pool.idle.get_mut().insert(2, VecDeque::from([CfWorkerEntry {
+            ws: stale, created: now_monotonic(), worker_domain: "worker.example".into(),
+        }]));
+        let pool = Arc::new(pool);
+        pool.refill_now(2, "192.0.2.2".into(), vec!["worker.example".into()]).await;
+        wait_until(async || calls.load(Ordering::Relaxed) == 1 && pool.idle.lock().await.get(&2).is_some_and(|bucket| !bucket.is_empty())).await;
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), old_peer.read_to_end(&mut bytes)).await.unwrap().unwrap();
+        pool.reset().await;
+    }
+
+    #[tokio::test]
+    async fn worker_misses_respect_backoff_and_reset_cancels_retry() {
+        let (mut pool, calls) = worker_pool(vec![]);
+        pool.timing.backoff_initial = 0.1;
+        let pool = Arc::new(pool);
+        for _ in 0..10 {
+            assert!(pool.get(2, "192.0.2.2".into(), vec!["worker.example".into()]).await.is_none());
+        }
+        wait_until(async || !pool.refill_failures.lock().await.is_empty()).await;
+        for _ in 0..10 {
+            assert!(pool.get(2, "192.0.2.2".into(), vec!["worker.example".into()]).await.is_none());
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        pool.reset().await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(pool.rotating.lock().await.is_empty());
+        assert!(pool.refilling.lock().await.is_empty());
+        assert!(pool.refill_failures.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_miss_replaces_eof_and_closed_sockets_and_empty_domains_disable_pool() {
+        for closed in [false, true] {
+            let (stale, peer) = crate::ws::test_socket().await;
+            if closed { stale.closed.store(true, Ordering::Relaxed); }
+            drop(peer);
+            let (ready, _peer) = crate::ws::test_socket().await;
+            let (mut pool, calls) = worker_pool(vec![Some((ready, "worker.example".into()))]);
+            pool.idle.get_mut().insert(2, VecDeque::from([CfWorkerEntry {
+                ws: stale, created: now_monotonic(), worker_domain: "worker.example".into(),
+            }]));
+            let pool = Arc::new(pool);
+            assert!(pool.get(2, "192.0.2.2".into(), vec![]).await.is_none());
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(pool.get(2, "192.0.2.2".into(), vec!["worker.example".into()]).await.is_none());
+            wait_until(async || pool.idle.lock().await.get(&2).is_some_and(|bucket| !bucket.is_empty())).await;
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            pool.reset().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_handshake_drain_stops_at_byte_limit_and_handles_eof() {
+        let bytes = vec![0u8; BAD_HANDSHAKE_DRAIN_LIMIT + 10];
+        let mut reader = bytes.as_slice();
+        drain_bad_handshake(&mut reader).await.unwrap();
+        assert_eq!(reader.len(), 10);
+        let mut reader = &b"short"[..];
+        drain_bad_handshake(&mut reader).await.unwrap();
+        assert!(reader.is_empty());
+        let (mut stalled, _peer) = tokio::io::duplex(16);
+        assert!(tokio::time::timeout(Duration::from_millis(20), drain_bad_handshake(&mut stalled)).await.is_err());
+    }
     #[test]
     fn tcp_attempt_is_unique_and_failure_backs_off() {
         let dst = "192.0.2.123";

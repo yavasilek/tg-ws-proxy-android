@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -191,11 +191,20 @@ enum WsWriter {
 }
 
 pub struct RawWebSocket {
+    transport: socket2::Socket,
     reader: tokio::sync::Mutex<WsReader>,
     writer: tokio::sync::Mutex<WsWriter>,
     frag: tokio::sync::Mutex<Vec<u8>>,
     pub closed: AtomicBool,
     pub secure: bool,
+}
+
+// Synchronous shutdown also runs if close() is cancelled while writing a frame.
+struct ClosingTransport<'a>(&'a socket2::Socket);
+impl Drop for ClosingTransport<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl RawWebSocket {
@@ -206,6 +215,25 @@ impl RawWebSocket {
     /// Совместимость: закрыт ли транспорт (аналог writer.transport.is_closing()).
     pub fn transport_closing(&self) -> bool {
         self.is_closed()
+    }
+
+    pub async fn transport_stale(&self) -> bool {
+        if self.is_closed() { return true; }
+        let Ok(mut reader) = self.reader.try_lock() else { return false; };
+        // Poll once without consuming buffered bytes or waiting for traffic.
+        let stale = std::future::poll_fn(|cx| {
+            let result = match &mut *reader {
+                WsReader::Tls(reader) => std::pin::Pin::new(reader).poll_fill_buf(cx),
+                WsReader::Plain(reader) => std::pin::Pin::new(reader).poll_fill_buf(cx),
+            };
+            std::task::Poll::Ready(match result {
+                std::task::Poll::Ready(Ok(bytes)) => bytes.is_empty(),
+                std::task::Poll::Ready(Err(_)) => true,
+                std::task::Poll::Pending => false,
+            })
+        }).await;
+        if stale { self.closed.store(true, Ordering::Relaxed); }
+        stale
     }
 
     pub async fn send(&self, data: &[u8]) -> Result<(), WsError> {
@@ -335,14 +363,15 @@ impl RawWebSocket {
     }
 
     pub async fn close(&self) {
-        if self.closed.swap(true, Ordering::Relaxed) {
-            return;
+        let _closing = ClosingTransport(&self.transport);
+        let was_closed = self.closed.swap(true, Ordering::Relaxed);
+        if !was_closed {
+            let frame = build_frame(OP_CLOSE, &[], true);
+            let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
         }
-        // Best-effort close frame + shutdown транспорта.
-        let frame = build_frame(OP_CLOSE, &[], true);
-        let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
+        // Even an earlier EOF, read/write error or peer close must close the socket.
         let mut writer = self.writer.lock().await;
-        let _ = shutdown_match(&mut writer).await;
+        let _ = tokio::time::timeout(WS_CONTROL_TIMEOUT, shutdown_match(&mut writer)).await;
     }
 
     // recv с дедлайном чтения (для bridge).
@@ -626,6 +655,7 @@ async fn handshake_tls(
     domain: &str,
     path: &str,
     timeout: Duration,
+    transport: socket2::Socket,
 ) -> Result<RawWebSocket, WsError> {
     let mut ws_key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut ws_key_bytes);
@@ -643,6 +673,7 @@ async fn handshake_tls(
     let (status_code, first_line, headers) = read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
+            transport,
             reader: tokio::sync::Mutex::new(WsReader::Tls(bufreader)),
             writer: tokio::sync::Mutex::new(WsWriter::Tls(write_half)),
             frag: tokio::sync::Mutex::new(Vec::new()),
@@ -665,6 +696,7 @@ async fn handshake_plain(
     domain: &str,
     path: &str,
     timeout: Duration,
+    transport: socket2::Socket,
 ) -> Result<RawWebSocket, WsError> {
     let mut ws_key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut ws_key_bytes);
@@ -682,6 +714,7 @@ async fn handshake_plain(
     let (status_code, first_line, headers) = read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
         return Ok(RawWebSocket {
+            transport,
             reader: tokio::sync::Mutex::new(WsReader::Plain(bufreader)),
             writer: tokio::sync::Mutex::new(WsWriter::Plain(write_half)),
             frag: tokio::sync::Mutex::new(Vec::new()),
@@ -806,10 +839,12 @@ pub async fn ws_connect_once_full(
         Err(_) => return Err(WsError::Timeout),
     };
     set_sock_opts(&raw_conn);
+    // A duplicate socket handle allows cancellation-safe shutdown of both halves.
+    let transport = socket2::SockRef::from(&raw_conn).try_clone()?;
 
     if !secure {
         let (read_half, write_half) = tokio::io::split(raw_conn);
-        return handshake_plain(read_half, write_half, domain, path, timeout).await;
+        return handshake_plain(read_half, write_half, domain, path, timeout, transport).await;
     }
 
     let sni_name = sni.unwrap_or(domain);
@@ -843,7 +878,7 @@ pub async fn ws_connect_once_full(
     };
 
     let (read_half, write_half) = tokio::io::split(tls_conn);
-    handshake_tls(read_half, write_half, domain, path, timeout).await
+    handshake_tls(read_half, write_half, domain, path, timeout, transport).await
 }
 
 // wsConnect: пытается ip, при необходимости резолвит DoH
@@ -967,8 +1002,70 @@ pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWe
 }
 
 #[cfg(test)]
+pub(crate) async fn test_socket() -> (RawWebSocket, TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let transport = socket2::SockRef::from(&socket).try_clone().unwrap();
+    let (reader, writer) = tokio::io::split(socket);
+    (RawWebSocket {
+        transport,
+        reader: tokio::sync::Mutex::new(WsReader::Plain(BufReader::new(reader))),
+        writer: tokio::sync::Mutex::new(WsWriter::Plain(writer)),
+        frag: tokio::sync::Mutex::new(Vec::new()),
+        closed: AtomicBool::new(false), secure: false,
+    }, peer)
+}
+
+#[cfg(test)]
 mod tls_regression_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn peer_close_and_repeated_close_release_transport_without_extra_frames() {
+        let (ws, mut peer) = test_socket().await;
+        peer.write_all(&build_frame(OP_CLOSE, &[3, 232], false)).await.unwrap();
+        assert!(ws.recv().await.is_err());
+        ws.close().await;
+        ws.close().await;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut response)).await.unwrap().unwrap();
+        assert_eq!(response.len(), 8); // One masked CLOSE with its two-byte status.
+        assert_eq!(response[0], 0x88);
+    }
+
+    #[tokio::test]
+    async fn cancelled_close_guard_shuts_down_the_socket() {
+        let (ws, mut peer) = test_socket().await;
+        let ws = Arc::new(ws);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn({
+            let ws = ws.clone(); let started = started.clone();
+            async move {
+                let _closing = ClosingTransport(&ws.transport);
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+        });
+        started.notified().await;
+        task.abort();
+        let _ = task.await;
+        let mut byte = [0];
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), peer.read(&mut byte)).await.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_probe_detects_eof_and_preserves_buffered_frames() {
+        let (ws, mut peer) = test_socket().await;
+        peer.write_all(&build_frame(OP_BINARY, b"kept", false)).await.unwrap();
+        assert!(!ws.transport_stale().await);
+        assert_eq!(ws.recv().await.unwrap(), b"kept");
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ws.transport_stale().await { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        ws.close().await;
+    }
     #[test]
     fn fronting_still_rejects_invalid_certificate_chains() {
         let roots =

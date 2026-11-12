@@ -2,10 +2,11 @@ use crate::config::{log_debug, log_warn, STATS};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -19,6 +20,43 @@ const CLIENT_RANDOM_LEN: usize = 32;
 const SESSION_ID_OFFSET: usize = 44;
 
 const TIMESTAMP_TOLERANCE: i64 = 120;
+const REPLAY_WINDOW: Duration = Duration::from_secs(2 * TIMESTAMP_TOLERANCE as u64 + 1);
+const REPLAY_CACHE_SIZE: usize = 65536;
+
+// Process-wide, so stopping and restarting the proxy does not admit a replay.
+static REPLAY_CACHE: once_cell::sync::Lazy<parking_lot::Mutex<ReplayCache>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(ReplayCache::new(REPLAY_WINDOW, REPLAY_CACHE_SIZE)));
+
+struct ReplayCache {
+    window: Duration,
+    capacity: usize,
+    expiry: HashMap<[u8; 32], Instant>,
+    order: VecDeque<([u8; 32], Instant)>,
+}
+
+impl ReplayCache {
+    fn new(window: Duration, capacity: usize) -> Self {
+        assert!(capacity > 0);
+        Self { window, capacity, expiry: HashMap::new(), order: VecDeque::new() }
+    }
+
+    fn first_seen_at(&mut self, random: [u8; 32], now: Instant) -> bool {
+        while self.order.front().is_some_and(|(_, expiry)| *expiry <= now) {
+            let (key, _) = self.order.pop_front().unwrap();
+            self.expiry.remove(&key);
+        }
+        // Check before eviction: a repeated key in a full cache is still a replay.
+        if self.expiry.contains_key(&random) { return false; }
+        if self.expiry.len() >= self.capacity {
+            let (key, _) = self.order.pop_front().unwrap();
+            self.expiry.remove(&key);
+        }
+        let expiry = now + self.window;
+        self.expiry.insert(random, expiry);
+        self.order.push_back((random, expiry));
+        true
+    }
+}
 const TLS_APPDATA_MAX: usize = 16384;
 
 const READ_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -448,6 +486,15 @@ impl AsyncWrite for TlsRecordWriter {
     }
 }
 
+fn verify_fresh_client_hello(data: &[u8], secret: &[u8]) -> Result<([u8; 32], Vec<u8>, i64), &'static str> {
+    let verified = verify_client_hello(data, secret).ok_or("verify failed")?;
+    // Only authenticated hellos can occupy the cache; random probes cannot evict it.
+    if !REPLAY_CACHE.lock().first_seen_at(verified.0, Instant::now()) {
+        return Err("hello replayed");
+    }
+    Ok(verified)
+}
+
 pub async fn server_handshake(
     mut conn: TcpStream,
     first: u8,
@@ -482,8 +529,8 @@ pub async fn server_handshake(
     client_hello.extend_from_slice(&tls_header);
     client_hello.extend_from_slice(&body);
 
-    match verify_client_hello(&client_hello, secret) {
-        Some((client_random, session_id, ts)) => {
+    match verify_fresh_client_hello(&client_hello, secret) {
+        Ok((client_random, session_id, ts)) => {
             log_debug(&format!("[{}] Fake TLS handshake ok (ts={})", label, ts));
             let info = parse_client_hello(&client_hello).unwrap_or_default();
             let delay_ms = 8 + (rand::thread_rng().next_u32() % 17) as u64;
@@ -500,10 +547,11 @@ pub async fn server_handshake(
                 write: Box::new(TlsRecordWriter::new(w)),
             })
         }
-        None => {
+        Err(reason) => {
             log_debug(&format!(
-                "[{}] Fake TLS verify failed (size={} rec={}) -> masking",
+                "[{}] Fake TLS {} (size={} rec={}) -> masking",
                 label,
+                reason,
                 client_hello.len(),
                 record_len
             ));
@@ -556,6 +604,52 @@ async fn proxy_to_masking_domain(conn: TcpStream, initial: Vec<u8>, domain: &str
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+    #[test]
+    fn replay_cache_expires_bounds_memory_and_checks_duplicates_before_eviction() {
+        let now = Instant::now();
+        let mut cache = ReplayCache::new(Duration::from_secs(10), 2);
+        assert!(cache.first_seen_at([1; 32], now));
+        assert!(cache.first_seen_at([2; 32], now));
+        assert!(!cache.first_seen_at([1; 32], now));
+        assert!(!cache.first_seen_at([2; 32], now));
+        assert!(cache.first_seen_at([3; 32], now));
+        assert_eq!(cache.expiry.len(), 2);
+        assert!(!cache.first_seen_at([2; 32], now + Duration::from_millis(9999)));
+        assert!(cache.first_seen_at([2; 32], now + Duration::from_secs(10)));
+        assert_eq!(cache.expiry.len(), 1);
+        assert_eq!(cache.order.len(), 1);
+    }
+
+    #[test]
+    fn replay_window_includes_timestamp_rounding_and_cache_survives_runtime_restart() {
+        let now = Instant::now();
+        let mut cache = ReplayCache::new(REPLAY_WINDOW, REPLAY_CACHE_SIZE);
+        assert!(cache.first_seen_at([1; 32], now));
+        assert!(!cache.first_seen_at([1; 32], now + Duration::from_millis(240999)));
+        assert!(cache.first_seen_at([1; 32], now + REPLAY_WINDOW));
+        let key: [u8; 32] = rand::random();
+        assert!(REPLAY_CACHE.lock().first_seen_at(key, now));
+        // No pool or runtime owns the cache; it remains the same process-wide object.
+        assert!(!REPLAY_CACHE.lock().first_seen_at(key, now));
+    }
+
+    #[test]
+    fn only_authenticated_client_hellos_enter_the_process_wide_replay_cache() {
+        let secret = [17u8; 16];
+        let mut hello = vec![0u8; 64];
+        rand::thread_rng().fill_bytes(&mut hello[48..]);
+        hello[..6].copy_from_slice(&[0x16, 3, 1, 0, 59, 1]);
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let mut mac = HmacSha256::new_from_slice(&secret).unwrap();
+        mac.update(&hello);
+        let mut random: [u8; 32] = mac.finalize().into_bytes().into();
+        for (byte, time) in random[28..].iter_mut().zip(timestamp.to_le_bytes()) { *byte ^= time; }
+        hello[11..43].copy_from_slice(&random);
+        assert!(verify_client_hello(&hello, &secret).is_some());
+        assert_eq!(verify_fresh_client_hello(&hello, &[18; 16]), Err("verify failed"));
+        assert!(verify_fresh_client_hello(&hello, &secret).is_ok());
+        assert_eq!(verify_fresh_client_hello(&hello, &secret), Err("hello replayed"));
+    }
     #[test]
     fn server_hello_mirrors_hybrid_and_authenticates_all_records() {
         let secret = [9u8; 16];

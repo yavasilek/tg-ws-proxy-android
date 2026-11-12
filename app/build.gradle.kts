@@ -12,9 +12,9 @@ android {
     defaultConfig {
         applicationId = "com.yavasilek.tgwsproxy"
         targetSdk = 35
-        versionCode = 133
-        versionName = "1.3.3"
-        buildConfigField("String", "UPSTREAM_VERSION", "\"1.11.3\"")
+        versionCode = 134
+        versionName = "1.3.4"
+        buildConfigField("String", "UPSTREAM_VERSION", "\"1.11.4\"")
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
